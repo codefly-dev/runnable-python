@@ -23,6 +23,7 @@ from .protocol import (
     INTERRUPTED,
     INVALID_INPUT,
     INVALID_OUTPUT,
+    MAX_ENVELOPE_BYTES,
     REQUEST_PATH_VARIABLE,
     TIMEOUT,
     ProtocolError,
@@ -61,11 +62,13 @@ class _Signals:
         self.outcome = ""
 
     def deadline(self, *_: object) -> None:
-        self.outcome = TIMEOUT
+        if not self.outcome:
+            self.outcome = TIMEOUT
         raise _Deadline()
 
     def interruption(self, *_: object) -> None:
-        self.outcome = INTERRUPTED
+        if not self.outcome:
+            self.outcome = INTERRUPTED
         raise _Interruption()
 
 
@@ -76,7 +79,9 @@ def main() -> int:
         contract = Contract.load(root / CONTRACT_FILE)
         request_path = _required(REQUEST_PATH_VARIABLE)
         completion_path = _required(COMPLETION_PATH_VARIABLE)
-        request = Request.parse(Path(request_path).read_bytes(), contract.max_input_bytes)
+        with open(request_path, "rb") as request_file:
+            raw = request_file.read(contract.max_input_bytes + MAX_ENVELOPE_BYTES + 1)
+        request = Request.parse(raw, contract.max_input_bytes)
     except (OSError, KeyError, ValueError, ProtocolError) as err:
         # Nothing here is bound to an invocation identity, so there is no
         # completion to write: the launcher reads the exit code alone.
@@ -124,11 +129,6 @@ def _invoke(contract: Contract, request: Request, root: Path) -> _Outcome:
     except SchemaError as err:
         return _Outcome(INVALID_INPUT, error_kind="contract", error_message=str(err))
 
-    try:
-        handler = _load_handler(contract, root)
-    except Exception as err:  # any import-time failure of author code
-        return _Outcome(FAILED, error_kind="handler-import", error_message=_describe(err))
-
     context = Context(
         invocation=request.identity,
         runnable=request.runnable,
@@ -144,12 +144,13 @@ def _invoke(contract: Contract, request: Request, root: Path) -> _Outcome:
         )
 
     signals = _Signals()
-    result = _run(handler, context, request.payload, remaining, signals)
-    if signals.outcome and result.outcome == COMPLETED:
+    result = _run(contract, context, request.payload, root, remaining, signals)
+    if signals.outcome and result.outcome != signals.outcome:
         return _Outcome(
             signals.outcome,
             error_kind="swallowed",
-            error_message=f"the handler returned after a {signals.outcome} signal",
+            error_message=f"the invocation received a {signals.outcome} signal; "
+            f"subsequent outcome: {result.outcome}: {result.error_message}",
         )
     if result.outcome != COMPLETED:
         return result
@@ -162,9 +163,10 @@ def _invoke(contract: Contract, request: Request, root: Path) -> _Outcome:
 
 
 def _run(
-    handler: Callable[[Context, dict[str, Any]], Any],
+    contract: Contract,
     context: Context,
     payload: dict[str, Any],
+    root: Path,
     remaining: float,
     signals: _Signals,
 ) -> _Outcome:
@@ -174,7 +176,12 @@ def _run(
         signal.SIGINT: signal.signal(signal.SIGINT, signals.interruption),
     }
     signal.setitimer(signal.ITIMER_REAL, remaining)
+    stage = "handler-import"
     try:
+        handler = _load_handler(contract, root)
+        if signals.outcome:
+            return _Outcome(signals.outcome, error_kind="signal", error_message="interrupted while importing the handler")
+        stage = "handler"
         output = handler(context, payload)
     except _Deadline:
         return _Outcome(TIMEOUT, error_kind="deadline", error_message="the deadline passed")
@@ -183,7 +190,7 @@ def _run(
             INTERRUPTED, error_kind="signal", error_message="the invocation was interrupted"
         )
     except BaseException as err:  # noqa: BLE001 — a handler exit is a failure, not a success
-        return _Outcome(FAILED, error_kind="handler", error_message=_describe(err))
+        return _Outcome(FAILED, error_kind=stage, error_message=_describe(err))
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         for number, handler_before in previous.items():

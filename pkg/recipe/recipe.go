@@ -69,6 +69,7 @@ func Write(runnable *resources.Runnable, prepared *prepare.Prepared, directory s
 		Platforms:  Platforms,
 		Entrypoint: []string{
 			filepath.Join(WorkDirectory, prepare.Environment, "bin", "python"),
+			"-I",
 			filepath.Join(WorkDirectory, prepare.EntryFile),
 		},
 		Toolchain: "python-" + version,
@@ -103,7 +104,7 @@ COPY --from=build %s %s
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 USER 65532:65532
-ENTRYPOINT ["%s/%s/bin/python", "%s/%s"]
+ENTRYPOINT ["%s/%s/bin/python", "-I", "%s/%s"]
 `,
 		version, UVVersion, WorkDirectory,
 		prepare.RequirementsFile,
@@ -128,7 +129,7 @@ func copyContext(root string, directory string) error {
 		if relative == "." {
 			return nil
 		}
-		if entry.IsDir() && entry.Name() == prepare.Environment {
+		if entry.IsDir() && (entry.Name() == prepare.Environment || entry.Name() == prepare.InterpreterDirectory || entry.Name() == prepare.PackagesDirectory) {
 			return filepath.SkipDir
 		}
 		destination := filepath.Join(directory, relative)

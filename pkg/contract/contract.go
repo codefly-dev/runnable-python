@@ -61,6 +61,9 @@ const (
 // bounds input and output; core leaves the log bound to the harness.
 const DefaultMaxLogBytes uint64 = 256 * 1024
 
+// MaxEnvelopeBytes bounds framing separately from the declared input payload.
+const MaxEnvelopeBytes uint64 = 64 * 1024
+
 // HandlerAttribute is the function every generated handler exposes.
 const HandlerAttribute = "handle"
 

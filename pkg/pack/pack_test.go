@@ -12,6 +12,7 @@ import (
 
 	"github.com/codefly-dev/core/resources"
 
+	"github.com/codefly-dev/runnable-python/pkg/generate"
 	"github.com/codefly-dev/runnable-python/pkg/pack"
 	"github.com/codefly-dev/runnable-python/pkg/prepare"
 )
@@ -52,6 +53,9 @@ func TestTheBuildPinsEveryInputItWasBuiltFrom(t *testing.T) {
 	write(t, filepath.Join(dir, "pyproject.toml"), "[project]\n")
 	write(t, filepath.Join(dir, "uv.lock"), "version = 1\n")
 
+	if err := generate.Generate(runnable, dir); err != nil {
+		t.Fatal(err)
+	}
 	build, err := pack.Build(runnable, dir, "python-3.12.14")
 	if err != nil {
 		t.Fatal(err)
@@ -109,11 +113,11 @@ func TestTheSamePreparedTreeAlwaysPackagesToTheSameDigest(t *testing.T) {
 		Toolchain: "python-3.12.14",
 		Command:   []string{filepath.Join(prepare.Environment, "bin", "python"), prepare.EntryFile},
 	}
-	first, err := pack.Native(runnable, runnable.Agent, dir, prepared, filepath.Join(t.TempDir(), "a.tar.gz"))
+	first, err := pack.Native(runnable, runnable.Agent, prepared, filepath.Join(t.TempDir(), "a.tar.gz"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := pack.Native(runnable, runnable.Agent, dir, prepared, filepath.Join(t.TempDir(), "b.tar.gz"))
+	second, err := pack.Native(runnable, runnable.Agent, prepared, filepath.Join(t.TempDir(), "b.tar.gz"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +143,7 @@ func TestTheEvidenceRecordsTheAgentThatBuiltIt(t *testing.T) {
 	write(t, filepath.Join(dir, "uv.lock"), "")
 	prepared := &prepare.Prepared{Root: preparedTree(t), Toolchain: "python-3.12.14", Command: []string{"x"}}
 
-	evidence, err := pack.Native(runnable, runnable.Agent, dir, prepared, filepath.Join(t.TempDir(), "a.tar.gz"))
+	evidence, err := pack.Native(runnable, runnable.Agent, prepared, filepath.Join(t.TempDir(), "a.tar.gz"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +204,14 @@ func preparedTree(t *testing.T) string {
 		t.Fatal(err)
 	}
 	write(t, filepath.Join(root, prepare.EntryFile), "import sys\n")
-	write(t, filepath.Join(root, prepare.SourceDirectory, "handler.py"), "def handle(context, input):\n    return {}\n")
+	source := filepath.Join(root, prepare.SourceDirectory)
+	runnable := load(t, source, declaration)
+	write(t, filepath.Join(source, "handler.py"), "def handle(context, input):\n    return {}\n")
+	write(t, filepath.Join(source, "pyproject.toml"), "[project]\n")
+	write(t, filepath.Join(source, "uv.lock"), "version = 1\n")
+	if err := generate.Generate(runnable, source); err != nil {
+		t.Fatal(err)
+	}
 	return root
 }
 

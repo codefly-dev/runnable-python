@@ -41,8 +41,11 @@ will look it up by. `deadline` is required and has a time zone: an invocation
 never runs unbounded, and a harness never invents a bound.
 
 `input` is bounded by `execution.payload.max-input-bytes` (1 MiB by default).
-The bound is checked before parsing, so an over-bound request never reaches the
-contract.
+The payload is measured as compact UTF-8 JSON (no ASCII escaping), independently
+of the framing. The envelope has a separate 64 KiB bound. The file read is capped
+at the payload bound plus 64 KiB plus one sentinel byte, before parsing; the
+parsed input is then checked against its own payload bound. This framing remains
+a proposal for core #472; callers must not assume it is already a shared core API.
 
 ## Completion
 
@@ -85,17 +88,21 @@ its schema, protocol and identity. A process that exits 0 without a readable,
 identity-bound completion is an *ambiguous* invocation, and `recovery` decides
 what may be done about it — never a silent retry of an external effect.
 
-A handler that catches the deadline or the interruption and returns normally
-still completes as `timeout` or `interrupted`: the signal, not the handler's
-error handling, decides.
+The first observed deadline or interruption retains precedence even when the
+handler catches it and fails during cleanup or returns invalid output. Imports
+run under the same timer and signal handlers as the function call; an already
+expired request never imports author code.
 
 ## Logs
 
-`stdout` and `stderr` are the log streams. Each is bounded at 256 KiB per
-invocation; past the bound the harness writes one
+`stdout` and `stderr` are the log streams. Each forwards at most 256 KiB per
+invocation plus one truncation marker; past the bound the harness writes one
 `[codefly] log truncated at N bytes` marker and drops the rest. Truncation
-never changes an outcome — core bounds input and output and leaves the log
-bound to the harness, which is why it is stated here rather than assumed.
+never changes an outcome. The harness redirects file descriptors, so Python,
+native-library and inherited subprocess writes all traverse the bound. The
+launcher must additionally bound its log transport and supervise the entire
+process group, including descendants that outlive the harness. That ownership
+must be ratified in core #472.
 
 ## The bounded schema profile
 

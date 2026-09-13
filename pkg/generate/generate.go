@@ -103,21 +103,30 @@ func Confine(dir string, relative string) (string, error) {
 		return "", fmt.Errorf("resolve runnable directory: %w", err)
 	}
 	target := filepath.Join(root, relative)
-	resolved, err := filepath.EvalSymlinks(target)
-	if err != nil {
-		// A path that does not exist yet is confined by its own spelling; its
-		// parent is what a symlink could redirect.
+	ancestor := target
+	var missing []string
+	var resolved string
+	for {
+		resolved, err = filepath.EvalSymlinks(ancestor)
+		if err == nil {
+			break
+		}
 		if !os.IsNotExist(err) {
 			return "", err
 		}
-		parent, parentErr := filepath.EvalSymlinks(filepath.Dir(target))
-		if parentErr != nil {
-			if !os.IsNotExist(parentErr) {
-				return "", parentErr
-			}
-			parent = filepath.Dir(target)
+		// A dangling symlink is not a missing directory we can safely create.
+		if _, statErr := os.Lstat(ancestor); statErr == nil {
+			return "", fmt.Errorf("path %q contains a dangling symlink", relative)
 		}
-		resolved = filepath.Join(parent, filepath.Base(target))
+		missing = append(missing, filepath.Base(ancestor))
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			return "", err
+		}
+		ancestor = parent
+	}
+	for i := len(missing) - 1; i >= 0; i-- {
+		resolved = filepath.Join(resolved, missing[i])
 	}
 	if resolved != root && !strings.HasPrefix(resolved, root+string(filepath.Separator)) {
 		return "", fmt.Errorf("path %q resolves outside the runnable directory", relative)
@@ -139,7 +148,7 @@ func handlerTemplate(runnable *resources.Runnable) []byte {
 	if description == "" {
 		description = fmt.Sprintf("the %s operation", runnable.Name)
 	}
-	return []byte(fmt.Sprintf(`"""%s"""
+	return []byte(fmt.Sprintf(`%q
 
 from codefly_runnable import Context
 

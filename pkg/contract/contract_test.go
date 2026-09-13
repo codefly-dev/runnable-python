@@ -30,6 +30,7 @@ func TestTheFramingIsOneContract(t *testing.T) {
 		fmt.Sprintf("INTERRUPTED = %q", contract.OutcomeInterrupted),
 		fmt.Sprintf("EXIT_PROTOCOL = %d", contract.ExitProtocol),
 		fmt.Sprintf("DEFAULT_MAX_LOG_BYTES = %d * 1024", contract.DefaultMaxLogBytes/1024),
+		fmt.Sprintf("MAX_ENVELOPE_BYTES = %d * 1024", contract.MaxEnvelopeBytes/1024),
 	} {
 		if !strings.Contains(protocol, declaration) {
 			t.Errorf("the harness does not declare %s", declaration)

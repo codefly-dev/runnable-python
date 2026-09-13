@@ -56,6 +56,7 @@ class Runnable:
     ) -> Invocation:
         request = self.generated / "request.json"
         completion = self.generated / "completion.json"
+        completion.unlink(missing_ok=True)
         if raw_request is None:
             deadline = datetime.now(timezone.utc) + timedelta(seconds=deadline_in)
             raw_request = json.dumps(

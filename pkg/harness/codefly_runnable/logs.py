@@ -1,67 +1,86 @@
-"""Bounded log streams.
-
-A handler's diagnostics never decide an outcome, so an over-talkative handler
-is truncated with a visible marker instead of failing the invocation.
-"""
+"""Bound process file descriptors, including native and inherited child writes."""
 
 from __future__ import annotations
 
+import os
+import select
 import sys
-from typing import TextIO
+import threading
+import time
 
 TRUNCATION_MARKER = "\n[codefly] log truncated at {limit} bytes\n"
 
 
-class BoundedStream:
-    """A text stream that stops forwarding once the byte bound is reached."""
+class _Stream:
+    def __init__(self, descriptor: int, limit: int) -> None:
+        self.descriptor = descriptor
+        self.limit = limit
+        self.saved = os.dup(descriptor)
+        self.reader, writer = os.pipe()
+        self.stop_at: float | None = None
+        self.thread = threading.Thread(target=self._drain, daemon=True)
+        os.dup2(writer, descriptor)
+        os.close(writer)
+        self.thread.start()
 
-    def __init__(self, wrapped: TextIO, limit: int) -> None:
-        self._wrapped = wrapped
-        self._limit = limit
-        self._written = 0
-        self._truncated = False
+    def _write(self, data: bytes) -> None:
+        while data:
+            written = os.write(self.saved, data)
+            data = data[written:]
 
-    def write(self, text: str) -> int:
-        size = len(text.encode("utf-8"))
-        if self._truncated:
-            return len(text)
-        if self._written + size > self._limit:
-            self._truncated = True
-            self._wrapped.write(TRUNCATION_MARKER.format(limit=self._limit))
-            self._wrapped.flush()
-            return len(text)
-        self._written += size
-        return self._wrapped.write(text)
+    def _drain(self) -> None:
+        written = 0
+        truncated = False
+        try:
+            while self.stop_at is None or time.monotonic() < self.stop_at:
+                ready, _, _ = select.select([self.reader], [], [], 0.05)
+                if not ready:
+                    if self.stop_at is not None:
+                        break
+                    continue
+                data = os.read(self.reader, 8192)
+                if not data:
+                    break
+                keep = data[:max(0, self.limit - written)]
+                self._write(keep)
+                written += len(keep)
+                if len(keep) < len(data) and not truncated:
+                    self._write(TRUNCATION_MARKER.format(limit=self.limit).encode())
+                    truncated = True
+        except (BrokenPipeError, OSError):
+            # A detached log consumer cannot change an invocation's outcome.
+            pass
+        finally:
+            os.close(self.reader)
 
-    def flush(self) -> None:
-        self._wrapped.flush()
-
-    def isatty(self) -> bool:
-        return False
-
-    def fileno(self) -> int:
-        return self._wrapped.fileno()
-
-    @property
-    def truncated(self) -> bool:
-        return self._truncated
+    def close(self) -> None:
+        os.dup2(self.saved, self.descriptor)
+        # A child which outlives its handler may still hold the pipe open.
+        # Drain pending diagnostics without waiting indefinitely for that child.
+        self.stop_at = time.monotonic() + 0.2
+        self.thread.join()
+        os.close(self.saved)
 
 
 class bounded_logs:
-    """Bound both log streams for the duration of handler execution."""
+    """Forward at most limit bytes plus one truncation marker per stream.
+
+    The launcher must also supervise the whole process group and bound its log
+    transport. A harness cannot control a child after the harness has exited.
+    """
 
     def __init__(self, limit: int) -> None:
-        self._limit = limit
-        self._stdout: TextIO | None = None
-        self._stderr: TextIO | None = None
+        self.limit = limit
+        self.streams: list[_Stream] = []
 
     def __enter__(self) -> "bounded_logs":
-        self._stdout, self._stderr = sys.stdout, sys.stderr
-        sys.stdout = BoundedStream(self._stdout, self._limit)
-        sys.stderr = BoundedStream(self._stderr, self._limit)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        self.streams = [_Stream(1, self.limit), _Stream(2, self.limit)]
         return self
 
     def __exit__(self, *_: object) -> None:
         sys.stdout.flush()
         sys.stderr.flush()
-        sys.stdout, sys.stderr = self._stdout, self._stderr
+        for stream in self.streams:
+            stream.close()

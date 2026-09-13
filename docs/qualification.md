@@ -1,5 +1,10 @@
 # Qualification milestone — 2026-09-12
 
+**Historical baseline at `b4d5c12`.** The review changed the harness and native
+archive layout, so the digests and `.venv` command below identify the earlier
+experiment. See [milestone 2](milestone_2_review_fixes.md) for the corrected
+implementation and current checks. The earlier k3d runs remain debugging evidence.
+
 What this agent has been proven to do, what it has not, and where the next
 session resumes. [Issue #1](https://github.com/codefly-dev/runnable-python/issues/1)
 is the acceptance list this measures against.

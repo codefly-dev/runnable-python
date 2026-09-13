@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -87,6 +88,10 @@ def handle(context: Context, input: Input) -> Output:
 func TestANativePackageCompletesAnInvocation(t *testing.T) {
 	ctx := context.Background()
 	workspace := t.TempDir()
+	builderPython := filepath.Join(workspace, "builder-python")
+	t.Setenv("UV_PYTHON_INSTALL_DIR", builderPython)
+	t.Setenv("UV_PYTHON_BIN_DIR", filepath.Join(workspace, "builder-bin"))
+
 	source := filepath.Join(workspace, "runnables", "word-count")
 
 	runnable := declare(t, ctx, source)
@@ -96,7 +101,10 @@ func TestANativePackageCompletesAnInvocation(t *testing.T) {
 	if err := generate.Generate(runnable, source); err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	write(t, filepath.Join(source, "handler.py"), implementation)
+	// Verify a locked third-party dependency is carried into the installed package.
+	project := filepath.Join(source, generate.ProjectFile)
+	write(t, project, strings.Replace(read(t, project), "dependencies = []", "dependencies = [\"idna==3.10\"]", 1))
+	write(t, filepath.Join(source, "handler.py"), "import idna\nassert idna.__version__ == \"3.10\"\n"+implementation)
 
 	prepared, err := prepare.Prepare(ctx, runnable, source, filepath.Join(workspace, "build", "native"))
 	if err != nil {
@@ -106,9 +114,12 @@ func TestANativePackageCompletesAnInvocation(t *testing.T) {
 		t.Fatalf("toolchain %q is not the declared interpreter", prepared.Toolchain)
 	}
 
+	// A source edit after preparation must not rewrite the archived build's evidence.
+	write(t, filepath.Join(source, "handler.py"), "def handle(context, input):\n    return {\"count\": 999}\n")
+
 	output := filepath.Join(workspace, "out")
 	archive := filepath.Join(output, "word-count-0.1.0.tar.gz")
-	evidence, err := pack.Native(runnable, runnable.Agent, source, prepared, archive)
+	evidence, err := pack.Native(runnable, runnable.Agent, prepared, archive)
 	if err != nil {
 		t.Fatalf("pack: %v", err)
 	}
@@ -122,6 +133,29 @@ func TestANativePackageCompletesAnInvocation(t *testing.T) {
 	}
 	installed := filepath.Join(workspace, "installed", "word-count")
 	unpack(t, archive, installed)
+	// Remove access to both the prepared tree and the builder's interpreter.
+	// The installed command must use only its own archive contents.
+	if err := os.RemoveAll(prepared.Root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(builderPython, builderPython+"-unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	archivedHandler, err := os.ReadFile(filepath.Join(installed, prepare.SourceDirectory, "handler.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var build struct {
+		Handler struct {
+			Digest string `json:"digest"`
+		} `json:"handler"`
+	}
+	if err := json.Unmarshal(evidence.Build, &build); err != nil {
+		t.Fatal(err)
+	}
+	if want := fmt.Sprintf("sha256:%x", sha256.Sum256(archivedHandler)); build.Handler.Digest != want {
+		t.Fatalf("build evidence describes a different handler: got %s, archive %s", build.Handler.Digest, want)
+	}
 
 	empty := invoke(t, installed, command(t, artifact), map[string]any{"text": "one two three"})
 	if empty.outcome() != contract.OutcomeCompleted {

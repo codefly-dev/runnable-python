@@ -5,7 +5,7 @@
 // without inferring anything from the language or the template: every field of
 // RunnableBuild and the NATIVE artifact, measured from the bytes that were
 // built. codefly-dev/core#472 is freezing how this crosses the agent/CLI seam;
-// until it does, the agent writes this document and the CLI reads it.
+// until it does, this document is a proposal, not a supported CLI handoff.
 package pack
 
 import (
@@ -53,7 +53,6 @@ type Evidence struct {
 func Native(
 	runnable *resources.Runnable,
 	agent *resources.Agent,
-	source string,
 	prepared *prepare.Prepared,
 	archive string,
 ) (*Evidence, error) {
@@ -64,7 +63,7 @@ func Native(
 	if err != nil {
 		return nil, err
 	}
-	build, err := Build(runnable, source, prepared.Toolchain)
+	build, err := Build(runnable, filepath.Join(prepared.Root, prepare.SourceDirectory), prepared.Toolchain)
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +95,7 @@ func Build(runnable *resources.Runnable, source string, toolchain string) (*base
 	}
 	sort.Slice(inputs, func(i, j int) bool { return inputs[i].Path < inputs[j].Path })
 
-	harnessDigest, err := harness.Digest()
+	harnessDigest, err := harness.DigestDirectory(filepath.Join(source, generate.GeneratedDirectory))
 	if err != nil {
 		return nil, err
 	}

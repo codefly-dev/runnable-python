@@ -21,6 +21,7 @@ REQUEST_PATH_VARIABLE = "CODEFLY_RUNNABLE_REQUEST"
 COMPLETION_PATH_VARIABLE = "CODEFLY_RUNNABLE_COMPLETION"
 
 DEFAULT_MAX_LOG_BYTES = 256 * 1024
+MAX_ENVELOPE_BYTES = 64 * 1024
 
 COMPLETED = "completed"
 INVALID_INPUT = "invalid_input"
@@ -120,9 +121,9 @@ class Request:
 
     @staticmethod
     def parse(raw: bytes, max_input_bytes: int) -> "Request":
-        if len(raw) > max_input_bytes:
+        if len(raw) > max_input_bytes + MAX_ENVELOPE_BYTES:
             raise ProtocolError(
-                f"request is {len(raw)} bytes, over the declared {max_input_bytes} byte bound"
+                "request exceeds the payload plus envelope byte bound"
             )
         try:
             document = json.loads(raw.decode("utf-8"))
@@ -141,6 +142,15 @@ class Request:
         payload = document.get("input")
         if not isinstance(payload, dict):
             raise ProtocolError("request.input must be an object")
+        payload_size = len(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                                      separators=(",", ":")).encode("utf-8"))
+        if payload_size > max_input_bytes:
+            raise ProtocolError(
+                f"input is {payload_size} bytes, over the declared {max_input_bytes} byte bound"
+            )
+        envelope = {key: value for key, value in document.items() if key != "input"}
+        if len(json.dumps(envelope, ensure_ascii=False).encode("utf-8")) > MAX_ENVELOPE_BYTES:
+            raise ProtocolError("request envelope exceeds its byte bound")
         return Request(
             identity=InvocationIdentity.parse(document.get("invocation"), "request.invocation"),
             runnable=RunnableIdentity.parse(document.get("runnable"), "request.runnable"),
@@ -193,10 +203,10 @@ def write_completion(path: str, document: dict[str, Any], max_output_bytes: int)
     The rename is what makes a truncated write unreadable rather than
     ambiguous: a launcher either sees the whole document or no document.
     """
-    encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    encoded = json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     if document.get("outcome") == COMPLETED:
         payload = json.dumps(
-            document.get("output"), sort_keys=True, separators=(",", ":")
+            document.get("output"), ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
         if len(payload) > max_output_bytes:
             raise ProtocolError(

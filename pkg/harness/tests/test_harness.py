@@ -413,3 +413,81 @@ def handle(context, input):
 
     assert result.exit_code == 0, result.stderr
     assert result.completion["outcome"] == "completed"
+
+
+def test_payload_limit_excludes_framing(runnable):
+    unit = runnable("def handle(context, input):\n    return {}\n",
+                    **{"max-input-bytes": 2})
+    result = unit.invoke({})
+    assert result.exit_code == 0, result.stderr
+    assert result.completion["output"] == {}
+
+
+def test_expired_request_never_imports_author_code(runnable):
+    unit = runnable('''
+from pathlib import Path
+Path(__file__).with_name("imported").write_text("author code ran")
+def handle(context, input):
+    return {}
+''')
+    result = unit.invoke({}, deadline_in=-1)
+    assert result.exit_code == 67
+    assert not (unit.root / "imported").exists()
+
+
+def test_deadline_covers_author_imports(runnable):
+    unit = runnable('''
+import time
+time.sleep(30)
+def handle(context, input):
+    return {}
+''')
+    result = unit.invoke({}, deadline_in=0.3, timeout=3)
+    assert result.exit_code == 67
+    assert result.completion["outcome"] == "timeout"
+
+
+def test_cleanup_error_preserves_timeout(runnable):
+    unit = runnable('''
+import time
+def handle(context, input):
+    try:
+        time.sleep(30)
+    except Exception:
+        raise ValueError("cleanup failed")
+''')
+    result = unit.invoke({}, deadline_in=0.3)
+    assert result.exit_code == 67
+    assert result.completion["outcome"] == "timeout"
+    assert "cleanup failed" in result.completion["error"]["message"]
+
+
+def test_invalid_return_preserves_interruption(runnable):
+    unit = runnable('''
+import time
+def handle(context, input):
+    try:
+        time.sleep(30)
+    except Exception:
+        return None
+''')
+    result = unit.invoke({}, interrupt_after=0.3)
+    assert result.exit_code == 68
+    assert result.completion["outcome"] == "interrupted"
+
+
+def test_file_descriptor_and_subprocess_logs_are_bounded(runnable):
+    unit = runnable('''
+import os
+import subprocess
+import sys
+def handle(context, input):
+    os.write(1, b"x" * 10000)
+    subprocess.run([sys.executable, "-c", "import os; os.write(2, b'y' * 10000)"], check=True)
+    return {}
+''', **{"max-log-bytes": 1024})
+    result = unit.invoke({})
+    assert result.exit_code == 0, result.stderr
+    for stream in (result.stdout, result.stderr):
+        assert "log truncated at 1024 bytes" in stream
+        assert len(stream.encode()) < 1100

@@ -2,7 +2,9 @@
 
 The Codefly language agent for typed, finite Python operations: generate a handler, prepare its dependencies, and produce identified native packages and container build recipes.
 
-**Status: generation, harness, preparation and packaging are implemented and qualified natively, in a Linux image and in disposable k3d; no version is released yet, and the CLI-to-agent gRPC surface waits on [core #472](https://github.com/codefly-dev/core/issues/472).** [docs/qualification.md](docs/qualification.md) records exactly what was proven, what was not, and where to resume; [Implementation issue #1](https://github.com/codefly-dev/runnable-python/issues/1) tracks the milestone.
+**Status: generation, harness, preparation and packaging are implemented; archive relocation and harness behavior are regression-tested; no version is released yet, and the CLI-to-agent gRPC surface waits on [core #472](https://github.com/codefly-dev/core/issues/472).** [docs/qualification.md](docs/qualification.md) records exactly what was proven, what was not, and where to resume; [Implementation issue #1](https://github.com/codefly-dev/runnable-python/issues/1) tracks the milestone.
+
+The review corrections and current validation are recorded in [milestone 2](docs/milestone_2_review_fixes.md). Earlier image/k3d observations are historical and do not qualify the Codefly/Orchestration path.
 
 ## What belongs here
 
@@ -30,9 +32,9 @@ The CLI receives language-specific build and launch facts through the shared con
 
 [Core PR #471](https://github.com/codefly-dev/core/pull/471) merged at `6a40c4bf28ac3dcebd534c32040349be96626605`. It introduces `runnable.codefly.yaml`, agent kind `codefly:runnable` (`Agent_RUNNABLE`), and the immutable `RunnablePackage` and `RunnableBinding` contracts. The agent name is `python`; distribution uses the `runnable-python` prefix.
 
-[Core #472](https://github.com/codefly-dev/core/issues/472) is the shared handoff still to establish, raised out of [CLI #638](https://github.com/codefly-dev/cli/issues/638): Runnable loading over gRPC, transfer of the native command and build evidence, and precise invocation/completion framing. Until it lands this agent advertises no builder capability, `pkg/pack` writes its evidence as a versioned document the CLI reads, and [docs/protocol.md](docs/protocol.md) is this agent's implemented proposal for the framing.
+[Core #472](https://github.com/codefly-dev/core/issues/472) is the shared handoff still to establish, raised out of [CLI #638](https://github.com/codefly-dev/cli/issues/638): Runnable loading over gRPC, transfer of the native command and build evidence, and precise invocation/completion framing. Until it lands this agent advertises no builder capability, `pkg/pack` writes evidence as a proposed versioned document; the CLI does not consume it yet, and [docs/protocol.md](docs/protocol.md) is this agent's implemented proposal for the framing.
 
-The first proof generates a neutral Runnable in a separate workspace and exercises real typed I/O, first natively and then through actual invocation Jobs in disposable k3d. The agent's half is done and recorded in [docs/qualification.md](docs/qualification.md); the durable path through Codefly and Orchestration — and with it immutable version selection and reconnect behavior — waits on core #472 and [Orchestration #63](https://github.com/obin-ai/module-runtime/issues/63).
+The first proof generates a neutral Runnable in a separate workspace and exercises real typed I/O, first natively and then through actual invocation Jobs in disposable k3d. The baseline debugging proof is recorded in [docs/qualification.md](docs/qualification.md); the durable path through Codefly and Orchestration — and with it immutable version selection and reconnect behavior — waits on core #472 and [Orchestration #63](https://github.com/obin-ai/module-runtime/issues/63).
 
 [Core #470](https://github.com/codefly-dev/core/issues/470) remains the parent delivery specification. The [Go agent repository](https://github.com/codefly-dev/runnable-go) exists separately; Go implementation follows the Python/native/k3d milestone. Domain-module adoption, engine changes, infra-base and canonical handbook updates remain later work.
 

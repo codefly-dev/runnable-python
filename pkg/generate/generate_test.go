@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -61,37 +62,26 @@ execution:
     max-output-bytes: 2048
 `
 
-const expectedTypes = `"""Typed bindings generated from runnable.codefly.yaml. Do not edit."""
-
-from __future__ import annotations
-
-from typing import NotRequired, TypedDict
-
-
-class InputOptionsLimitsItem(TypedDict):
-    max_words: int
-    strict: bool
-
-
-class InputOptions(TypedDict):
-    stop_words: list[str] | None
-    limits: list[InputOptionsLimitsItem]
-
-
-class Input(TypedDict):
-    text: str
-    options: NotRequired[InputOptions]
-
-
-class Output(TypedDict):
-    count: int
-`
-
+// Exercise the generated Python module and its runtime typing metadata.
 func TestTypesRenderTheBoundedProfile(t *testing.T) {
-	runnable := load(t, t.TempDir())
-
-	if got := string(generate.Types(runnable)); got != expectedTypes {
-		t.Errorf("generated types:\n%s\nwant:\n%s", got, expectedTypes)
+	dir := t.TempDir()
+	runnable := load(t, dir)
+	if err := generate.Generate(runnable, dir); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("uv", "run", "--no-project", "--python", "3.12", "python", "-c", `
+from typing import get_type_hints, get_args, NotRequired
+import codefly_types as t
+assert t.Input.__required_keys__ == {"text"}
+assert t.Input.__optional_keys__ == {"options"}
+assert get_type_hints(t.Input)["text"] is str
+assert get_type_hints(t.InputOptions)["stop_words"] == list[str] | None
+assert get_type_hints(t.InputOptionsLimitsItem) == {"max_words": int, "strict": bool}
+assert get_type_hints(t.Output) == {"count": int}
+`)
+	command.Dir = dir
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("generated Python types: %v\n%s", err, output)
 	}
 }
 
@@ -107,7 +97,7 @@ func TestAnEmptyContractStillGeneratesBothTypes(t *testing.T) {
 
 	types := string(generate.Types(runnable))
 
-	if !strings.Contains(types, "class Input(TypedDict):\n    pass") {
+	if !strings.Contains(types, "Input = TypedDict(\"Input\", {})") {
 		t.Errorf("an explicitly empty input schema did not generate a type:\n%s", types)
 	}
 	if strings.Contains(types, "NotRequired") {
@@ -246,4 +236,53 @@ func read(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(content)
+}
+
+func TestTypesKeepKeywordAndCollidingWireNames(t *testing.T) {
+	dir := t.TempDir()
+	runnable := load(t, dir)
+	runnable.Contract.Input.Fields = []*resources.RunnableField{
+		{Name: "class", Type: resources.RunnableFieldString},
+		{Name: "__private", Type: resources.RunnableFieldInteger},
+		{Name: "a_b", Type: resources.RunnableFieldObject, Fields: []*resources.RunnableField{{Name: "text", Type: resources.RunnableFieldString}}},
+		{Name: "aB", Type: resources.RunnableFieldObject, Fields: []*resources.RunnableField{{Name: "count", Type: resources.RunnableFieldInteger}}},
+	}
+	if err := runnable.Contract.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := generate.Generate(runnable, dir); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("uv", "run", "--no-project", "--python", "3.12", "python", "-c", `
+from typing import get_type_hints
+import codefly_types as t
+fields = get_type_hints(t.Input)
+assert fields["class"] is str
+assert fields["__private"] is int
+assert get_type_hints(fields["a_b"]) == {"text": str}
+assert get_type_hints(fields["aB"]) == {"count": int}
+`)
+	command.Dir = dir
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("generated wire names: %v\n%s", err, output)
+	}
+}
+
+func TestScaffoldConfinesMissingDescendantsOfSymlinks(t *testing.T) {
+	dir, outside := t.TempDir(), t.TempDir()
+	runnable := load(t, dir)
+	if err := os.Symlink(outside, filepath.Join(dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	runnable.Entrypoint.Handler = "link/new/sub/handler.py"
+	if err := generate.Scaffold(runnable, dir); err == nil {
+		t.Fatal("scaffold accepted a path outside the runnable")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "new")); !os.IsNotExist(err) {
+		t.Fatalf("scaffold wrote outside its directory: %v", err)
+	}
+	runnable.Entrypoint.Handler = "new/sub/handler.py"
+	if err := generate.Scaffold(runnable, dir); err != nil {
+		t.Fatalf("confined new directories should work: %v", err)
+	}
 }

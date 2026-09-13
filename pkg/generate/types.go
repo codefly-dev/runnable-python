@@ -23,6 +23,7 @@ const (
 func Types(runnable *resources.Runnable) []byte {
 	var classes []string
 	var needsNotRequired bool
+	g := &typeGenerator{names: make(map[*resources.RunnableField]string), used: map[string]bool{InputType: true, OutputType: true}}
 
 	for _, schema := range []struct {
 		name   string
@@ -31,7 +32,7 @@ func Types(runnable *resources.Runnable) []byte {
 		{InputType, runnable.Contract.Input.Fields},
 		{OutputType, runnable.Contract.Output.Fields},
 	} {
-		emitted, notRequired := renderObject(schema.name, schema.fields)
+		emitted, notRequired := g.renderObject(schema.name, schema.fields)
 		classes = append(classes, emitted...)
 		needsNotRequired = needsNotRequired || notRequired
 	}
@@ -43,7 +44,6 @@ func Types(runnable *resources.Runnable) []byte {
 
 	var out strings.Builder
 	out.WriteString("\"\"\"Typed bindings generated from runnable.codefly.yaml. Do not edit.\"\"\"\n\n")
-	out.WriteString("from __future__ import annotations\n\n")
 	fmt.Fprintf(&out, "from typing import %s", imports)
 	for _, class := range classes {
 		out.WriteString("\n\n\n")
@@ -55,45 +55,48 @@ func Types(runnable *resources.Runnable) []byte {
 
 // renderObject emits the nested classes of an object before the object itself,
 // so the module reads top to bottom without forward references.
-func renderObject(name string, fields []*resources.RunnableField) ([]string, bool) {
+func (g *typeGenerator) renderObject(name string, fields []*resources.RunnableField) ([]string, bool) {
 	var classes []string
 	var notRequired bool
 
 	for _, field := range fields {
-		nested, nestedNotRequired := renderNested(name, field)
+		nested, nestedNotRequired := g.renderNested(name, field)
 		classes = append(classes, nested...)
 		notRequired = notRequired || nestedNotRequired
 	}
 
 	var body strings.Builder
-	fmt.Fprintf(&body, "class %s(TypedDict):", name)
+	fmt.Fprintf(&body, "%s = TypedDict(%q, {", name, name)
 	if len(fields) == 0 {
-		body.WriteString("\n    pass")
+		body.WriteString("})")
 		return append(classes, body.String()), notRequired
 	}
 	for _, field := range fields {
-		annotation := annotationOf(name, field)
+		annotation := g.annotationOf(field)
 		if field.Optional {
 			annotation = fmt.Sprintf("NotRequired[%s]", annotation)
 			notRequired = true
 		}
-		fmt.Fprintf(&body, "\n    %s: %s", field.Name, annotation)
+		fmt.Fprintf(&body, "\n    %q: %s,", field.Name, annotation)
 	}
+	body.WriteString("\n})")
 	return append(classes, body.String()), notRequired
 }
 
-func renderNested(parent string, field *resources.RunnableField) ([]string, bool) {
+func (g *typeGenerator) renderNested(parent string, field *resources.RunnableField) ([]string, bool) {
 	switch field.Type {
 	case resources.RunnableFieldObject:
-		return renderObject(nestedName(parent, field.Name), field.Fields)
+		name := g.allocate(nestedName(parent, field.Name))
+		g.names[field] = name
+		return g.renderObject(name, field.Fields)
 	case resources.RunnableFieldArray:
-		return renderNested(nestedName(parent, field.Name), field.Items)
+		return g.renderNested(nestedName(parent, field.Name), field.Items)
 	default:
 		return nil, false
 	}
 }
 
-func annotationOf(parent string, field *resources.RunnableField) string {
+func (g *typeGenerator) annotationOf(field *resources.RunnableField) string {
 	var annotation string
 	switch field.Type {
 	case resources.RunnableFieldString:
@@ -103,9 +106,9 @@ func annotationOf(parent string, field *resources.RunnableField) string {
 	case resources.RunnableFieldBoolean:
 		annotation = "bool"
 	case resources.RunnableFieldObject:
-		annotation = nestedName(parent, field.Name)
+		annotation = g.names[field]
 	case resources.RunnableFieldArray:
-		annotation = fmt.Sprintf("list[%s]", annotationOf(nestedName(parent, field.Name), field.Items))
+		annotation = fmt.Sprintf("list[%s]", g.annotationOf(field.Items))
 	}
 	if field.Nullable {
 		annotation += " | None"
@@ -132,4 +135,20 @@ func camel(name string) string {
 		out.WriteString(part[1:])
 	}
 	return out.String()
+}
+
+// Names remain readable, while a shared allocator prevents distinct wire paths
+// from overwriting one another's classes after capitalization.
+type typeGenerator struct {
+	names map[*resources.RunnableField]string
+	used  map[string]bool
+}
+
+func (g *typeGenerator) allocate(hint string) string {
+	name := hint
+	for suffix := 2; g.used[name]; suffix++ {
+		name = fmt.Sprintf("%s%d", hint, suffix)
+	}
+	g.used[name] = true
+	return name
 }

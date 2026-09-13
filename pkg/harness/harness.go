@@ -63,8 +63,17 @@ func Write(dir string) error {
 // same digest ran the same harness bytes; a launcher never has to trust that
 // an agent version implies them.
 func Digest() (string, error) {
+	return digestSources(files)
+}
+
+// DigestDirectory measures the harness actually present in a prepared tree.
+func DigestDirectory(generated string) (string, error) {
+	return digestSources(os.DirFS(generated))
+}
+
+func digestSources(source fs.FS) (string, error) {
 	var paths []string
-	err := fs.WalkDir(files, Package, func(path string, entry fs.DirEntry, err error) error {
+	err := fs.WalkDir(source, Package, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -85,7 +94,7 @@ func Digest() (string, error) {
 	sort.Strings(paths)
 	digest := sha256.New()
 	for _, path := range paths {
-		content, err := files.ReadFile(path)
+		content, err := fs.ReadFile(source, path)
 		if err != nil {
 			return "", err
 		}
