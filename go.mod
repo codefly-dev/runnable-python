@@ -3,7 +3,7 @@ module github.com/codefly-dev/runnable-python
 go 1.27.1
 
 require (
-	github.com/codefly-dev/core v0.3.28-0.20260913013542-b3470f0096cd
+	github.com/codefly-dev/core v0.3.28-0.20260913182029-34d35397ac69
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/grpc v1.82.1
 	google.golang.org/protobuf v1.36.11
