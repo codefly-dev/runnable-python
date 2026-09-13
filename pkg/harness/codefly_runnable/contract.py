@@ -25,6 +25,7 @@ class Contract:
     max_input_bytes: int
     max_output_bytes: int
     max_log_bytes: int
+    runnable: dict
 
     @staticmethod
     def load(path: Path) -> "Contract":
@@ -43,6 +44,7 @@ class Contract:
             input=Schema.parse(document.get("input")),
             output=Schema.parse(document.get("output")),
             recovery=document["recovery"],
+            runnable=document["runnable"],
             max_input_bytes=int(document["max-input-bytes"]),
             max_output_bytes=int(document["max-output-bytes"]),
             max_log_bytes=int(document.get("max-log-bytes", DEFAULT_MAX_LOG_BYTES)),

@@ -3,21 +3,18 @@ package agent
 
 import (
 	"context"
+	"os/exec"
 
 	"github.com/codefly-dev/core/agents/services"
 	agentv0 "github.com/codefly-dev/core/generated/go/codefly/services/agent/v0"
 	"github.com/codefly-dev/core/resources"
 	runners "github.com/codefly-dev/core/runners/base"
-	pythonrunner "github.com/codefly-dev/core/runners/python"
 
 	"github.com/codefly-dev/runnable-python/pkg/prepare"
 )
 
-// Agent answers what this runnable agent is and what it can do. The
-// generation, preparation and packaging surface is not advertised: the
-// agent/CLI handoff for loading a runnable and returning its build evidence is
-// being frozen in codefly-dev/core#472, and an agent that advertises a
-// capability the CLI cannot drive is worse than one that advertises none.
+// Agent advertises the Runnable Builder lifecycle. The invocation process is
+// supervised by the caller, so this agent advertises no Runtime capability.
 type Agent struct {
 	agentv0.UnimplementedAgentServer
 
@@ -36,20 +33,22 @@ func (a *Agent) Manifest() *resources.Agent {
 
 // GetAgentInformation advertises the Python runnable agent.
 func (a *Agent) GetAgentInformation(_ context.Context, _ *agentv0.AgentInformationRequest) (*agentv0.AgentInformation, error) {
-	return services.Advertisement{
+	info := services.Advertisement{
 		CapabilityOnly: true,
 		Backends: runners.BackendSupport{
-			Local:  pythonrunner.HasUVRuntime,
-			Docker: true,
+			Local:  func() bool { _, err := exec.LookPath("uv"); return err == nil },
+			Docker: false,
 		},
 		Toolchains: []agentv0.Toolchain_Type{agentv0.Toolchain_PYTHON},
 		Languages:  []agentv0.Language_Type{agentv0.Language_PYTHON},
 		ReadMe: "Codefly Runnable agent for Python: typed handler scaffolding, the " +
 			resources.RunnableProtocolV1 + " harness, uv-locked dependency and interpreter " +
-			"preparation, identified native packages and Linux image recipes. Runnables pin " +
+			"preparation, native packages through Builder gRPC. Runnables pin " +
 			"their interpreter with spec." + prepare.PythonVersionKey + " (default " +
 			prepare.DefaultPythonVersion + ").",
-	}.Build(), nil
+	}.Build()
+	info.Capabilities = append(info.Capabilities, &agentv0.Capability{Type: agentv0.Capability_BUILDER})
+	return info, nil
 }
 
 // ListCommands returns no commands: everything this agent does happens through

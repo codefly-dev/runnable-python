@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 
+	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
 	"github.com/codefly-dev/core/resources"
 
 	"github.com/codefly-dev/runnable-python/pkg/contract"
@@ -53,6 +54,13 @@ func Scaffold(runnable *resources.Runnable, dir string) error {
 // harness enforces and the harness itself. Regenerating an unchanged
 // declaration produces the same bytes.
 func Generate(runnable *resources.Runnable, dir string) error {
+	return GenerateForRelease(runnable, dir, nil)
+}
+
+// GenerateForRelease binds the harness to the workspace-resolved release.
+// Standalone generation checks the declaration's name and version; the Builder
+// always supplies the complete identity resolved during Load.
+func GenerateForRelease(runnable *resources.Runnable, dir string, identity *basev0.RunnableIdentity) error {
 	module, err := HandlerModule(runnable.Entrypoint.Handler)
 	if err != nil {
 		return err
@@ -67,7 +75,11 @@ func Generate(runnable *resources.Runnable, dir string) error {
 	if err := harness.Write(generated); err != nil {
 		return fmt.Errorf("write harness: %w", err)
 	}
-	document, err := contract.Generate(runnable, module).Encode()
+	generatedContract := contract.Generate(runnable, module)
+	if identity != nil {
+		generatedContract.Runnable = map[string]string{"name": identity.GetName(), "module": identity.GetModule(), "workspace": identity.GetWorkspace(), "version": identity.GetVersion()}
+	}
+	document, err := generatedContract.Encode()
 	if err != nil {
 		return err
 	}

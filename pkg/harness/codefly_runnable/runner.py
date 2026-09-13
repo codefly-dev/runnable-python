@@ -27,6 +27,9 @@ from .protocol import (
     REQUEST_PATH_VARIABLE,
     TIMEOUT,
     ProtocolError,
+    HandlerFailure,
+    PROTOCOL,
+    PROTOCOL_VARIABLE,
     Request,
     completion_document,
     write_completion,
@@ -48,6 +51,7 @@ class _Outcome:
     output: dict[str, Any] | None = None
     error_kind: str = ""
     error_message: str = ""
+    failure: HandlerFailure | None = None
 
 
 class _Signals:
@@ -77,11 +81,13 @@ def main() -> int:
     root = Path(__file__).resolve().parent.parent
     try:
         contract = Contract.load(root / CONTRACT_FILE)
+        if _required(PROTOCOL_VARIABLE) != PROTOCOL:
+            raise ProtocolError("unsupported protocol environment")
         request_path = _required(REQUEST_PATH_VARIABLE)
         completion_path = _required(COMPLETION_PATH_VARIABLE)
         with open(request_path, "rb") as request_file:
-            raw = request_file.read(contract.max_input_bytes + MAX_ENVELOPE_BYTES + 1)
-        request = Request.parse(raw, contract.max_input_bytes)
+            raw = request_file.read(4 * ((contract.max_input_bytes + 2) // 3) + MAX_ENVELOPE_BYTES + 1)
+        request = Request.parse(raw, contract.max_input_bytes, contract.recovery, contract.runnable)
     except (OSError, KeyError, ValueError, ProtocolError) as err:
         # Nothing here is bound to an invocation identity, so there is no
         # completion to write: the launcher reads the exit code alone.
@@ -90,36 +96,27 @@ def main() -> int:
 
     with bounded_logs(contract.max_log_bytes):
         result = _invoke(contract, request, root)
-
-    document = completion_document(
-        identity=request.identity,
-        runnable=request.runnable,
-        outcome=result.outcome,
-        recovery=contract.recovery,
-        output=result.output,
-        error_kind=result.error_kind,
-        error_message=result.error_message,
-    )
-    try:
-        write_completion(completion_path, document, contract.max_output_bytes)
-    except ProtocolError as err:
-        document = completion_document(
-            identity=request.identity,
-            runnable=request.runnable,
-            outcome=INVALID_OUTPUT,
-            recovery=contract.recovery,
-            error_kind="payload-bound",
-            error_message=str(err),
-        )
-        write_completion(completion_path, document, contract.max_output_bytes)
-        return EXIT_CODES[INVALID_OUTPUT]
-    return EXIT_CODES[result.outcome]
+        # Only a validated success or the operation's explicit failure is certain.
+        # A crash, invalid payload or interruption leaves no result for core to
+        # misread as a known disposition of an external effect.
+        if result.outcome != COMPLETED and result.failure is None:
+            print(f"[codefly] {result.outcome}: {result.error_message}", file=sys.stderr)
+            return EXIT_CODES[result.outcome]
+        try:
+            document = completion_document(identity=request.identity, output=result.output, failure=result.failure)
+            write_completion(completion_path, document, contract.max_output_bytes)
+        except (OSError, ValueError, ProtocolError) as err:
+            print(f"[codefly] invalid_output: {err}", file=sys.stderr)
+            return EXIT_CODES[INVALID_OUTPUT]
+        return EXIT_CODES[result.outcome]
 
 
 def _required(variable: str) -> str:
     value = os.environ.get(variable)
     if not value:
         raise KeyError(f"{variable} is required: the launcher chooses both document paths")
+    if variable != PROTOCOL_VARIABLE and not os.path.isabs(value):
+        raise ProtocolError(f"{variable} must be an absolute path")
     return value
 
 
@@ -189,6 +186,10 @@ def _run(
         return _Outcome(
             INTERRUPTED, error_kind="signal", error_message="the invocation was interrupted"
         )
+    except HandlerFailure as err:
+        if stage == "handler":
+            return _Outcome(FAILED, failure=err)
+        return _Outcome(FAILED, error_message=_describe(err))
     except BaseException as err:  # noqa: BLE001 — a handler exit is a failure, not a success
         return _Outcome(FAILED, error_kind=stage, error_message=_describe(err))
     finally:

@@ -6,7 +6,7 @@ deadline and reports one unambiguous outcome.
 """
 
 from .context import Context
-from .protocol import InvocationIdentity, RunnableIdentity
+from .protocol import HandlerFailure, InvocationIdentity, RunnableIdentity
 from .schema import Schema, SchemaError
 
-__all__ = ["Context", "InvocationIdentity", "RunnableIdentity", "Schema", "SchemaError"]
+__all__ = ["HandlerFailure", "Context", "InvocationIdentity", "RunnableIdentity", "Schema", "SchemaError"]

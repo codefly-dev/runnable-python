@@ -1,220 +1,176 @@
-"""Wire framing of ``codefly.runnable/v1``.
-
-The launcher writes a request document, starts the process and reads a
-completion document from a path it chose; ``stdout`` and ``stderr`` carry logs
-only. See ``docs/protocol.md`` for the normative description.
-"""
-
+"""codefly.runnable/v1 proto3 JSON, defined by codefly-dev/core."""
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
+import re
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 PROTOCOL = "codefly.runnable/v1"
-REQUEST_SCHEMA = "codefly.runnable.request/v1"
-COMPLETION_SCHEMA = "codefly.runnable.completion/v1"
-
-REQUEST_PATH_VARIABLE = "CODEFLY_RUNNABLE_REQUEST"
-COMPLETION_PATH_VARIABLE = "CODEFLY_RUNNABLE_COMPLETION"
-
-DEFAULT_MAX_LOG_BYTES = 256 * 1024
+PROTOCOL_VARIABLE = "CODEFLY__RUNNABLE_PROTOCOL"
+REQUEST_PATH_VARIABLE = "CODEFLY__RUNNABLE_INVOCATION"
+COMPLETION_PATH_VARIABLE = "CODEFLY__RUNNABLE_RESULT"
+DEFAULT_MAX_LOG_BYTES = 4 * 1024 * 1024
 MAX_ENVELOPE_BYTES = 64 * 1024
 
+# Internal diagnostics. These are not RunnableCompletion outcomes.
 COMPLETED = "completed"
 INVALID_INPUT = "invalid_input"
 INVALID_OUTPUT = "invalid_output"
 FAILED = "failed"
 TIMEOUT = "timeout"
 INTERRUPTED = "interrupted"
-
-# A launcher distinguishes outcomes by the completion document; the exit code
-# repeats the distinction so a missing completion is never read as success.
-EXIT_CODES = {
-    COMPLETED: 0,
-    INVALID_INPUT: 64,
-    INVALID_OUTPUT: 65,
-    FAILED: 66,
-    TIMEOUT: 67,
-    INTERRUPTED: 68,
-}
+EXIT_CODES = {COMPLETED: 0, INVALID_INPUT: 64, INVALID_OUTPUT: 65,
+              FAILED: 66, TIMEOUT: 67, INTERRUPTED: 68}
 EXIT_PROTOCOL = 69
 
 
 class ProtocolError(Exception):
-    """The request or the environment does not satisfy the framing."""
+    """The invocation or environment does not satisfy the framing."""
+
+
+class HandlerFailure(Exception):
+    """An operation's explicit, certain failure; never use for an unknown effect."""
+    def __init__(self, code: str, message: str) -> None:
+        if not isinstance(code, str) or not 1 <= len(code) <= 128:
+            raise ValueError("failure code must contain 1 to 128 characters")
+        if not isinstance(message, str):
+            raise ValueError("failure message must be a string")
+        self.code = code
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
 class InvocationIdentity:
-    """Identity of one invocation, supplied by the caller and echoed back."""
-
     invocation: str
-    intent: str = ""
+    intent: str
     effect: str = ""
-
-    @staticmethod
-    def parse(raw: Any, at: str) -> "InvocationIdentity":
-        if not isinstance(raw, dict):
-            raise ProtocolError(f"{at} must be an object")
-        invocation = raw.get("invocation")
-        if not isinstance(invocation, str) or not invocation:
-            raise ProtocolError(f"{at}.invocation is required")
-        for key in ("intent", "effect"):
-            if key in raw and not isinstance(raw[key], str):
-                raise ProtocolError(f"{at}.{key} must be a string")
-        return InvocationIdentity(
-            invocation=invocation,
-            intent=raw.get("intent", ""),
-            effect=raw.get("effect", ""),
-        )
-
-    def document(self) -> dict[str, str]:
-        return {"invocation": self.invocation, "intent": self.intent, "effect": self.effect}
 
 
 @dataclass(frozen=True)
 class RunnableIdentity:
-    """Immutable release identity of the runnable being invoked."""
-
     name: str
-    module: str = ""
-    workspace: str = ""
-    version: str = ""
-
-    @staticmethod
-    def parse(raw: Any, at: str) -> "RunnableIdentity":
-        if not isinstance(raw, dict):
-            raise ProtocolError(f"{at} must be an object")
-        name = raw.get("name")
-        if not isinstance(name, str) or not name:
-            raise ProtocolError(f"{at}.name is required")
-        for key in ("module", "workspace", "version"):
-            if key in raw and not isinstance(raw[key], str):
-                raise ProtocolError(f"{at}.{key} must be a string")
-        return RunnableIdentity(
-            name=name,
-            module=raw.get("module", ""),
-            workspace=raw.get("workspace", ""),
-            version=raw.get("version", ""),
-        )
+    module: str
+    workspace: str
+    version: str
 
     def document(self) -> dict[str, str]:
-        return {
-            "name": self.name,
-            "module": self.module,
-            "workspace": self.workspace,
-            "version": self.version,
-        }
+        return vars(self).copy()
+
+
+def _identifier(document: dict, key: str, required: bool = True) -> str:
+    value = document.get(key, "")
+    if not isinstance(value, str) or len(value) > 128 or (required and not value):
+        raise ProtocolError(f"request.{key} must contain {'1' if required else '0'} to 128 characters")
+    return value
+
+
+def _json(raw: bytes) -> Any:
+    def constant(value):
+        raise ValueError(f"invalid JSON constant {value}")
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key {key}")
+            result[key] = value
+        return result
+    try:
+        return json.loads(raw.decode("utf-8"), parse_constant=constant, object_pairs_hook=unique)
+    except (UnicodeDecodeError, ValueError) as err:
+        raise ProtocolError(f"request is not UTF-8 JSON: {err}") from err
 
 
 @dataclass(frozen=True)
 class Request:
-    """One invocation request."""
-
     identity: InvocationIdentity
     runnable: RunnableIdentity
     deadline: datetime
     payload: dict[str, Any]
 
     @staticmethod
-    def parse(raw: bytes, max_input_bytes: int) -> "Request":
-        if len(raw) > max_input_bytes + MAX_ENVELOPE_BYTES:
-            raise ProtocolError(
-                "request exceeds the payload plus envelope byte bound"
-            )
-        try:
-            document = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as err:
-            raise ProtocolError(f"request is not UTF-8 JSON: {err}") from err
+    def parse(raw: bytes, max_input_bytes: int, recovery: str, expected: dict) -> "Request":
+        if len(raw) > 4 * ((max_input_bytes + 2) // 3) + MAX_ENVELOPE_BYTES:
+            raise ProtocolError("request exceeds the payload plus envelope byte bound")
+        document = _json(raw)
         if not isinstance(document, dict):
             raise ProtocolError("request must be an object")
-        if document.get("schema") != REQUEST_SCHEMA:
-            raise ProtocolError(
-                f"request schema {document.get('schema')!r} is not {REQUEST_SCHEMA!r}"
-            )
         if document.get("protocol") != PROTOCOL:
-            raise ProtocolError(
-                f"request protocol {document.get('protocol')!r} is not {PROTOCOL!r}"
-            )
-        payload = document.get("input")
+            raise ProtocolError(f"request protocol {document.get('protocol')!r} is not {PROTOCOL!r}")
+        allowed = {"protocol", "runnable", "invocation_id", "intent_id", "effect_id", "issued_at", "deadline", "input"}
+        if document.keys() - allowed:
+            raise ProtocolError("request contains unknown fields")
+        identity = InvocationIdentity(_identifier(document, "invocation_id"),
+                                      _identifier(document, "intent_id"),
+                                      _identifier(document, "effect_id", False))
+        if (recovery == "receipt") != bool(identity.effect):
+            raise ProtocolError("effect_id is required exactly for receipt recovery")
+        release = document.get("runnable")
+        keys = {"name", "module", "workspace", "version"}
+        if not isinstance(release, dict) or release.keys() != keys:
+            raise ProtocolError("request.runnable requires name, module, workspace and version")
+        if any(not isinstance(v, str) or not v for v in release.values()):
+            raise ProtocolError("request.runnable identity fields must be nonempty strings")
+        if any(release.get(key) != value for key, value in expected.items()):
+            raise ProtocolError("request names another Runnable release")
+        deadline = _instant(document.get("deadline"), "deadline")
+        issued = _instant(document.get("issued_at"), "issued_at")
+        if deadline <= issued:
+            raise ProtocolError("request.deadline must be after issued_at")
+        encoded = document.get("input")
+        try:
+            if not isinstance(encoded, str):
+                raise ValueError("input must be base64 text")
+            payload_bytes = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as err:
+            raise ProtocolError(f"request.input is not base64: {err}") from err
+        if len(payload_bytes) > max_input_bytes:
+            raise ProtocolError(f"input is {len(payload_bytes)} bytes, over the declared {max_input_bytes} byte bound")
+        payload = _json(payload_bytes)
         if not isinstance(payload, dict):
-            raise ProtocolError("request.input must be an object")
-        payload_size = len(json.dumps(payload, ensure_ascii=False, sort_keys=True,
-                                      separators=(",", ":")).encode("utf-8"))
-        if payload_size > max_input_bytes:
-            raise ProtocolError(
-                f"input is {payload_size} bytes, over the declared {max_input_bytes} byte bound"
-            )
-        envelope = {key: value for key, value in document.items() if key != "input"}
-        if len(json.dumps(envelope, ensure_ascii=False).encode("utf-8")) > MAX_ENVELOPE_BYTES:
-            raise ProtocolError("request envelope exceeds its byte bound")
-        return Request(
-            identity=InvocationIdentity.parse(document.get("invocation"), "request.invocation"),
-            runnable=RunnableIdentity.parse(document.get("runnable"), "request.runnable"),
-            deadline=_parse_deadline(document.get("deadline")),
-            payload=payload,
-        )
+            raise ProtocolError("request.input must decode to one JSON object")
+        return Request(identity, RunnableIdentity(**release), deadline, payload)
 
 
-def _parse_deadline(raw: Any) -> datetime:
+def _instant(raw: Any, field: str) -> datetime:
     if not isinstance(raw, str) or not raw:
-        raise ProtocolError("request.deadline is required: an invocation never runs unbounded")
+        raise ProtocolError(f"request.{field} is required")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})", raw):
+        raise ProtocolError(f"request.{field} is not an RFC 3339 instant")
     try:
-        deadline = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
     except ValueError as err:
-        raise ProtocolError(f"request.deadline {raw!r} is not an RFC 3339 instant") from err
-    if deadline.tzinfo is None:
-        raise ProtocolError(f"request.deadline {raw!r} has no time zone")
-    return deadline.astimezone(timezone.utc)
+        raise ProtocolError(f"request.{field} is not an RFC 3339 instant") from err
 
 
-def completion_document(
-    *,
-    identity: InvocationIdentity,
-    runnable: RunnableIdentity,
-    outcome: str,
-    recovery: str,
-    output: dict[str, Any] | None = None,
-    error_kind: str = "",
-    error_message: str = "",
-) -> dict[str, Any]:
-    """Build the completion bound to the identity the request carried."""
-    document: dict[str, Any] = {
-        "schema": COMPLETION_SCHEMA,
-        "protocol": PROTOCOL,
-        "invocation": identity.document(),
-        "runnable": runnable.document(),
-        "outcome": outcome,
-        "recovery": recovery,
-    }
-    if outcome == COMPLETED:
-        document["output"] = output
+def completion_document(*, identity: InvocationIdentity, output: dict | None = None,
+                        failure: HandlerFailure | None = None) -> dict:
+    document = {"protocol": PROTOCOL, "invocation_id": identity.invocation}
+    if failure is not None:
+        document.update(status="FAILED", error={"code": failure.code, "message": str(failure)})
     else:
-        document["error"] = {"kind": error_kind or outcome, "message": error_message}
+        payload = json.dumps(output, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        document.update(status="SUCCEEDED", output=base64.b64encode(payload).decode("ascii"))
     return document
 
 
-def write_completion(path: str, document: dict[str, Any], max_output_bytes: int) -> None:
-    """Write the completion atomically, refusing an over-bound payload.
-
-    The rename is what makes a truncated write unreadable rather than
-    ambiguous: a launcher either sees the whole document or no document.
-    """
-    encoded = json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    if document.get("outcome") == COMPLETED:
-        payload = json.dumps(
-            document.get("output"), ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-        if len(payload) > max_output_bytes:
-            raise ProtocolError(
-                f"output is {len(payload)} bytes, over the declared {max_output_bytes} byte bound"
-            )
-    staging = path + ".partial"
-    with open(staging, "wb") as handle:
-        handle.write(encoded)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(staging, path)
+def write_completion(path: str, document: dict, max_output_bytes: int) -> None:
+    if document["status"] == "SUCCEEDED" and len(base64.b64decode(document["output"])) > max_output_bytes:
+        raise ProtocolError(f"output exceeds the declared {max_output_bytes} byte bound")
+    encoded = json.dumps(document, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    staging = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=os.path.dirname(path), prefix=".result-", delete=False) as handle:
+            staging = handle.name
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(staging, path)
+    finally:
+        if staging and os.path.exists(staging):
+            os.unlink(staging)
