@@ -1,0 +1,20 @@
+version: 2
+
+project_name: runnable-python
+
+builds:
+  # This agent generates and packages Python; it does not inspect source with
+  # core's tree-sitter grammars, so it cross-compiles without CGO.
+  - id: runnable-python
+    binary: runnable-python
+    env:
+      - CGO_ENABLED=0
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    # Must match the asset core's downloader asks for:
+    # runnable-{name}_{version}_{os}_{arch}.tar.gz, holding runnable-{name}.
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
