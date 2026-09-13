@@ -4,8 +4,8 @@
 // The evidence is what a caller needs to assemble a core RunnablePackage
 // without inferring anything from the language or the template: every field of
 // RunnableBuild and the NATIVE artifact, measured from the bytes that were
-// built. codefly-dev/core#472 is freezing how this crosses the agent/CLI seam;
-// until it does, this document is a proposal, not a supported CLI handoff.
+// built. Builder returns these facts through the shared gRPC messages; this
+// package's JSON evidence is agent-private and is not a CLI handoff.
 package pack
 
 import (
@@ -32,7 +32,7 @@ import (
 	"github.com/codefly-dev/runnable-python/pkg/prepare"
 )
 
-// EvidenceSchema versions the document the agent writes for the CLI.
+// EvidenceSchema versions the agent-private diagnostic evidence document.
 const EvidenceSchema = "codefly.runnable-build-evidence/v1"
 
 // EvidenceFile is the document's name inside the build output directory.
@@ -138,6 +138,7 @@ func ConfigurationDigest(runnable *resources.Runnable) (string, error) {
 			"concurrency":      runnable.Execution.Concurrency,
 			"max-input-bytes":  runnable.Execution.MaxInputBytes(),
 			"max-output-bytes": runnable.Execution.MaxOutputBytes(),
+			"max-log-bytes":    runnable.Execution.MaxLogBytes(),
 		},
 		Spec:     runnable.Spec,
 		Protocol: runnable.Contract.Protocol,

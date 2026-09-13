@@ -1,9 +1,5 @@
-// Package contract holds the seam between the launcher and the generated
-// Python harness: the framing of codefly.runnable/v1 and the generated
-// contract document the harness reads at startup.
-//
-// docs/protocol.md is the normative description; this package and
-// harness/codefly_runnable are its two implementations.
+// Package contract defines agent-private generated configuration for the Python harness.
+// Public invocation framing belongs to codefly-dev/core.
 package contract
 
 import (
@@ -16,37 +12,10 @@ import (
 // Protocol is the only invocation protocol this agent generates for.
 const Protocol = resources.RunnableProtocolV1
 
-// Document schemas of the framing.
-const (
-	RequestSchema    = "codefly.runnable.request/v1"
-	CompletionSchema = "codefly.runnable.completion/v1"
+// GeneratedSchema identifies agent-private generated configuration, not wire framing.
+const GeneratedSchema = "codefly.runnable-generated-contract/v1"
 
-	// GeneratedSchema is the contract the agent writes beside the harness at
-	// generation time: what the harness enforces that a request does not carry.
-	GeneratedSchema = "codefly.runnable-generated-contract/v1"
-)
-
-// Environment variables through which a launcher hands the harness the two
-// document paths. Logs stay on stdout and stderr, which never carry data.
-const (
-	RequestPathVariable    = "CODEFLY_RUNNABLE_REQUEST"
-	CompletionPathVariable = "CODEFLY_RUNNABLE_COMPLETION"
-)
-
-// Outcomes of one invocation. They are distinct on purpose: a launcher that
-// cannot tell a timeout from a failure cannot decide whether an effect may be
-// recomputed.
-const (
-	OutcomeCompleted     = "completed"
-	OutcomeInvalidInput  = "invalid_input"
-	OutcomeInvalidOutput = "invalid_output"
-	OutcomeFailed        = "failed"
-	OutcomeTimeout       = "timeout"
-	OutcomeInterrupted   = "interrupted"
-)
-
-// Exit codes repeat the outcome so a missing completion document is never read
-// as success.
+// Exit codes are diagnostics only. Core classifies the observed process and result.
 const (
 	ExitCompleted     = 0
 	ExitInvalidInput  = 64
@@ -57,24 +26,18 @@ const (
 	ExitProtocol      = 69
 )
 
-// DefaultMaxLogBytes bounds each log stream of one invocation. The declaration
-// bounds input and output; core leaves the log bound to the harness.
-const DefaultMaxLogBytes uint64 = 256 * 1024
-
-// MaxEnvelopeBytes bounds framing separately from the declared input payload.
-const MaxEnvelopeBytes uint64 = 64 * 1024
-
 // HandlerAttribute is the function every generated handler exposes.
 const HandlerAttribute = "handle"
 
 // Generated is the contract document the agent writes beside the harness.
 type Generated struct {
-	Schema   string  `json:"schema"`
-	Protocol string  `json:"protocol"`
-	Handler  Handler `json:"handler"`
-	Input    Schema  `json:"input"`
-	Output   Schema  `json:"output"`
-	Recovery string  `json:"recovery"`
+	Schema   string            `json:"schema"`
+	Protocol string            `json:"protocol"`
+	Handler  Handler           `json:"handler"`
+	Input    Schema            `json:"input"`
+	Output   Schema            `json:"output"`
+	Recovery string            `json:"recovery"`
+	Runnable map[string]string `json:"runnable"`
 
 	MaxInputBytes  uint64 `json:"max-input-bytes"`
 	MaxOutputBytes uint64 `json:"max-output-bytes"`
@@ -115,7 +78,8 @@ func Generate(runnable *resources.Runnable, handlerModule string) *Generated {
 		Recovery:       string(runnable.Execution.Recovery),
 		MaxInputBytes:  runnable.Execution.MaxInputBytes(),
 		MaxOutputBytes: runnable.Execution.MaxOutputBytes(),
-		MaxLogBytes:    DefaultMaxLogBytes,
+		MaxLogBytes:    runnable.Execution.MaxLogBytes(),
+		Runnable:       map[string]string{"name": runnable.Name, "version": runnable.Version},
 	}
 }
 

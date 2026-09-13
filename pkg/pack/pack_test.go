@@ -23,7 +23,7 @@ version: 0.2.0
 agent:
   kind: codefly:runnable
   name: python
-  version: 0.0.1
+  version: 0.0.2
   publisher: codefly.dev
 contract:
   protocol: codefly.runnable/v1
@@ -165,7 +165,7 @@ func TestTheEvidenceRecordsTheAgentThatBuiltIt(t *testing.T) {
 		t.Errorf("schema = %v", document["schema"])
 	}
 	agent, _ := document["agent"].(map[string]any)
-	if agent["name"] != "python" || agent["version"] != "0.0.1" {
+	if agent["name"] != "python" || agent["version"] != "0.0.2" {
 		t.Errorf("agent = %v", agent)
 	}
 	identity, _ := document["identity"].(map[string]any)

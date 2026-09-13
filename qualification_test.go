@@ -15,7 +15,12 @@ import (
 	"testing"
 	"time"
 
+	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
 	"github.com/codefly-dev/core/resources"
+	corerunnable "github.com/codefly-dev/core/runnable"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/codefly-dev/runnable-python/pkg/contract"
 	"github.com/codefly-dev/runnable-python/pkg/generate"
@@ -31,7 +36,7 @@ version: 0.1.0
 agent:
   kind: codefly:runnable
   name: python
-  version: 0.0.1
+  version: 0.0.2
   publisher: codefly.dev
 contract:
   protocol: codefly.runnable/v1
@@ -128,6 +133,7 @@ func TestANativePackageCompletesAnInvocation(t *testing.T) {
 	}
 
 	artifact := artifacts(t, evidence)[0]
+	pkg := packageFromEvidence(t, runnable, evidence)
 	if artifact["kind"] != "NATIVE" {
 		t.Fatalf("artifact kind is %v", artifact["kind"])
 	}
@@ -157,15 +163,15 @@ func TestANativePackageCompletesAnInvocation(t *testing.T) {
 		t.Fatalf("build evidence describes a different handler: got %s, archive %s", build.Handler.Digest, want)
 	}
 
-	empty := invoke(t, installed, command(t, artifact), map[string]any{"text": "one two three"})
-	if empty.outcome() != contract.OutcomeCompleted {
+	empty := invoke(t, installed, command(t, artifact), pkg, map[string]any{"text": "one two three"})
+	if empty.outcome() != "SUCCEEDED" {
 		t.Fatalf("outcome %q: %v %s", empty.outcome(), empty.completion["error"], empty.stderr)
 	}
 	if got := empty.count(t); got != 3 {
 		t.Fatalf("count = %d, want 3", got)
 	}
 
-	filtered := invoke(t, installed, command(t, artifact), map[string]any{
+	filtered := invoke(t, installed, command(t, artifact), pkg, map[string]any{
 		"text":    "one two three",
 		"options": map[string]any{"stop_words": []string{"two"}},
 	})
@@ -173,7 +179,7 @@ func TestANativePackageCompletesAnInvocation(t *testing.T) {
 		t.Fatalf("filtered count = %d, want 2", got)
 	}
 
-	nulled := invoke(t, installed, command(t, artifact), map[string]any{
+	nulled := invoke(t, installed, command(t, artifact), pkg, map[string]any{
 		"text":    "one two three four",
 		"options": map[string]any{"stop_words": nil},
 	})
@@ -204,11 +210,13 @@ func TestAnInstalledPackageRefusesAnInvalidPayload(t *testing.T) {
 		t.Fatalf("prepare: %v", err)
 	}
 
-	result := invoke(t, prepared.Root, prepared.Command, map[string]any{"text": 3})
+	evidence, err := pack.Native(runnable, runnable.Agent, prepared, filepath.Join(workspace, "artifact.tar.gz"))
+	require.NoError(t, err)
+	result := invoke(t, prepared.Root, prepared.Command, packageFromEvidence(t, runnable, evidence), map[string]any{"text": 3})
 	if result.exit != contract.ExitInvalidInput {
 		t.Fatalf("exit = %d, want %d (%s)", result.exit, contract.ExitInvalidInput, result.stderr)
 	}
-	if result.outcome() != contract.OutcomeInvalidInput {
+	if result.outcome() != "CRASHED" {
 		t.Fatalf("outcome = %q", result.outcome())
 	}
 	if _, recorded := result.completion["output"]; recorded {
@@ -282,11 +290,11 @@ type invocation struct {
 	stdout     string
 	stderr     string
 	completion map[string]any
+	classified *basev0.RunnableCompletion
 }
 
 func (i invocation) outcome() string {
-	outcome, _ := i.completion["outcome"].(string)
-	return outcome
+	return i.classified.GetOutcome().String()
 }
 
 func (i invocation) count(t *testing.T) int {
@@ -304,53 +312,80 @@ func (i invocation) count(t *testing.T) int {
 
 // invoke runs one invocation the way a launcher does: a request document in, a
 // completion document out, logs on the process streams.
-func invoke(t *testing.T, root string, argv []string, payload map[string]any) invocation {
+func invoke(t *testing.T, root string, argv []string, pkg *basev0.RunnablePackage, payload map[string]any) invocation {
 	t.Helper()
-	request := filepath.Join(t.TempDir(), "request.json")
-	completion := filepath.Join(t.TempDir(), "completion.json")
-	document, err := json.Marshal(map[string]any{
-		"schema":     contract.RequestSchema,
-		"protocol":   contract.Protocol,
-		"invocation": map[string]string{"invocation": "inv-1", "intent": "intent-1", "effect": "effect-1"},
-		"runnable": map[string]string{
-			"name": "word-count", "module": "text", "workspace": "proof", "version": "0.1.0",
-		},
-		"deadline": time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
-		"input":    payload,
-	})
-	if err != nil {
-		t.Fatal(err)
+	requestPath := filepath.Join(t.TempDir(), "request.json")
+	resultPath := filepath.Join(t.TempDir(), "result.json")
+	input, err := json.Marshal(payload)
+	require.NoError(t, err)
+	started := time.Now()
+	inv, err := corerunnable.PrepareInvocation(&basev0.RunnableInvocation{
+		Protocol: corerunnable.ProtocolV1, Runnable: pkg.GetIdentity(), InvocationId: "inv-1", IntentId: "intent-1",
+		IssuedAt: timestamppb.New(started), Deadline: timestamppb.New(started.Add(time.Minute)), Input: input,
+	}, pkg)
+	require.NoError(t, err)
+	document, err := corerunnable.EncodeInvocation(inv)
+	require.NoError(t, err)
+	write(t, requestPath, string(document))
+	ctx, cancel := context.WithDeadline(t.Context(), inv.GetDeadline().AsTime())
+	defer cancel()
+	process := exec.CommandContext(ctx, filepath.Join(root, argv[0]), argv[1:]...)
+	process.Dir = root
+	process.Env = os.Environ()
+	for key, value := range corerunnable.InvocationEnvironment(inv, requestPath, resultPath) {
+		process.Env = append(process.Env, key+"="+value)
 	}
-	write(t, request, string(document))
-
-	command := exec.Command(filepath.Join(root, argv[0]), argv[1:]...)
-	command.Dir = root
-	command.Env = append(os.Environ(),
-		contract.RequestPathVariable+"="+request,
-		contract.CompletionPathVariable+"="+completion,
-	)
 	var stdout, stderr strings.Builder
-	command.Stdout, command.Stderr = &stdout, &stderr
-	runErr := command.Run()
-
-	result := invocation{exit: command.ProcessState.ExitCode(), stdout: stdout.String(), stderr: stderr.String()}
-	if runErr != nil && result.exit == 0 {
-		t.Fatalf("run invocation: %v", runErr)
-	}
-	recorded, err := os.ReadFile(completion)
+	process.Stdout, process.Stderr = &stdout, &stderr
+	runErr := process.Run()
+	require.NotNil(t, process.ProcessState, "start process: %v", runErr)
+	result := invocation{exit: process.ProcessState.ExitCode(), stdout: stdout.String(), stderr: stderr.String()}
+	recorded, err := os.ReadFile(resultPath)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			t.Fatal(err)
+		require.True(t, os.IsNotExist(err), "%v", err)
+	}
+	observed := corerunnable.Observation{Result: recorded, ExitCode: int32(result.exit), StartedAt: started, EndedAt: time.Now()}
+	result.classified, err = corerunnable.Complete(inv, pkg, observed)
+	require.NoError(t, err)
+	if recorded != nil {
+		parsed, err := corerunnable.ParseResult(recorded, inv, pkg)
+		require.NoError(t, err, string(recorded))
+		result.completion = map[string]any{}
+		if parsed.GetStatus() == basev0.RunnableResult_SUCCEEDED {
+			var output map[string]any
+			require.NoError(t, json.Unmarshal(parsed.GetOutput(), &output))
+			result.completion["output"] = output
 		}
-		return result
-	}
-	if err := json.Unmarshal(recorded, &result.completion); err != nil {
-		t.Fatalf("completion is not JSON: %v", err)
-	}
-	if identity, _ := result.completion["invocation"].(map[string]any); identity["invocation"] != "inv-1" {
-		t.Fatalf("completion is bound to %v, not the request identity", identity)
 	}
 	return result
+}
+
+func packageFromEvidence(t *testing.T, r *resources.Runnable, evidence *pack.Evidence) *basev0.RunnablePackage {
+	t.Helper()
+	build := &basev0.RunnableBuild{}
+	require.NoError(t, protojson.Unmarshal(evidence.Build, build))
+	var documents []json.RawMessage
+	require.NoError(t, json.Unmarshal(evidence.Artifacts, &documents))
+	var artifacts []*basev0.RunnableArtifact
+	for _, document := range documents {
+		artifact := &basev0.RunnableArtifact{}
+		require.NoError(t, protojson.Unmarshal(document, artifact))
+		artifacts = append(artifacts, artifact)
+	}
+	return preparedPackage(t, r, &basev0.RunnableIdentity{Name: r.Name, Module: "text", Workspace: "proof", Version: r.Version}, build, artifacts)
+}
+
+func preparedPackage(t *testing.T, r *resources.Runnable, identity *basev0.RunnableIdentity, build *basev0.RunnableBuild, artifacts []*basev0.RunnableArtifact) *basev0.RunnablePackage {
+	t.Helper()
+	declaration, err := r.Proto(t.Context())
+	require.NoError(t, err)
+	pkg, err := corerunnable.PreparePackage(&basev0.RunnablePackage{
+		Schema: corerunnable.PackageSchemaV1, Identity: identity, Agent: declaration.GetAgent(),
+		Contract: declaration.GetContract(), Execution: declaration.GetExecution(), Build: build, Artifacts: artifacts,
+		ServiceDependencies: declaration.GetServiceDependencies(), WorkspaceConfigurationDependencies: declaration.GetWorkspaceConfigurationDependencies(),
+	})
+	require.NoError(t, err)
+	return pkg
 }
 
 func artifacts(t *testing.T, evidence *pack.Evidence) []map[string]any {

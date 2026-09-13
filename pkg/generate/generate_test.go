@@ -20,7 +20,7 @@ version: 0.1.0
 agent:
   kind: codefly:runnable
   name: python
-  version: 0.0.1
+  version: 0.0.2
   publisher: codefly.dev
 contract:
   protocol: codefly.runnable/v1

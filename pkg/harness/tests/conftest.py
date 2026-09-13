@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import shutil
@@ -12,9 +13,8 @@ import pytest
 PACKAGE = Path(__file__).resolve().parent.parent / "codefly_runnable"
 
 IDENTITY = {
-    "invocation": "inv-7f3a",
-    "intent": "intent-2b19",
-    "effect": "effect-64c0",
+    "invocation_id": "inv-7f3a",
+    "intent_id": "intent-2b19",
 }
 RUNNABLE = {
     "name": "word-count",
@@ -37,6 +37,7 @@ class Runnable:
 
     def __init__(self, root: Path, handler: str, contract: dict) -> None:
         self.root = root
+        self.contract = contract
         generated = root / ".codefly"
         generated.mkdir(parents=True)
         shutil.copytree(PACKAGE, generated / "codefly_runnable")
@@ -53,27 +54,33 @@ class Runnable:
         interrupt_after: float | None = None,
         environment: dict | None = None,
         raw_request: bytes | None = None,
+        request_overrides: dict | None = None,
     ) -> Invocation:
         request = self.generated / "request.json"
         completion = self.generated / "completion.json"
-        completion.unlink(missing_ok=True)
+        # Deliberately not cleared here: clearing a stale result is the
+        # harness's own obligation, and doing it for it would hide a document
+        # surviving into a run that reports none.
         if raw_request is None:
             deadline = datetime.now(timezone.utc) + timedelta(seconds=deadline_in)
-            raw_request = json.dumps(
-                {
-                    "schema": "codefly.runnable.request/v1",
+            document = {
                     "protocol": "codefly.runnable/v1",
-                    "invocation": IDENTITY,
+                    **IDENTITY,
+                    **({"effect_id": "effect-64c0"} if self.contract["recovery"] == "receipt" else {}),
+                    "issued_at": (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat().replace("+00:00", "Z"),
                     "runnable": RUNNABLE,
                     "deadline": deadline.isoformat().replace("+00:00", "Z"),
-                    "input": payload,
+                    "input": base64.b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode(),
                 }
-            ).encode("utf-8")
+            if request_overrides:
+                document.update(request_overrides)
+            raw_request = json.dumps(document).encode("utf-8")
         request.write_bytes(raw_request)
 
         env = dict(os.environ)
-        env["CODEFLY_RUNNABLE_REQUEST"] = str(request)
-        env["CODEFLY_RUNNABLE_COMPLETION"] = str(completion)
+        env["CODEFLY__RUNNABLE_INVOCATION"] = str(request)
+        env["CODEFLY__RUNNABLE_RESULT"] = str(completion)
+        env["CODEFLY__RUNNABLE_PROTOCOL"] = "codefly.runnable/v1"
         env["PYTHONPATH"] = str(self.generated)
         if environment is not None:
             for key, value in environment.items():
@@ -99,6 +106,8 @@ class Runnable:
         recorded = None
         if completion.exists():
             recorded = json.loads(completion.read_text(encoding="utf-8"))
+            if "output" in recorded:
+                recorded["output"] = json.loads(base64.b64decode(recorded["output"]))
         return Invocation(process.returncode, stdout, stderr, recorded)
 
 
@@ -108,6 +117,7 @@ def runnable(tmp_path):
         contract = {
             "schema": "codefly.runnable-generated-contract/v1",
             "protocol": "codefly.runnable/v1",
+            "runnable": RUNNABLE,
             "handler": {"module": "handler", "attribute": "handle"},
             "input": input or {},
             "output": output or {},

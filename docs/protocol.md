@@ -1,118 +1,113 @@
-# `codefly.runnable/v1` — the launcher/harness seam
+# `codefly.runnable/v1` — launcher and Python harness
 
-One invocation is one process. A launcher writes a **request document**, starts
-the process, and reads a **completion document** from a path it chose. Both are
-UTF-8 JSON. `stdout` and `stderr` carry logs and never carry data, so a
-handler that prints cannot change an outcome.
+Core defines the public protocol in
+[`runnable_invocation.proto`](https://github.com/codefly-dev/core/blob/b3470f0096cd818d6a90c67dc31e9ad09824d822/proto/codefly/base/v0/runnable_invocation.proto)
+and supplies `PrepareInvocation`, `EncodeInvocation`, `InvocationEnvironment`,
+`ParseResult` and `Complete`. The Python process implements this wire format;
+Go qualification tests encode real requests with core and parse the actual
+Python result with core. The earlier agent-specific framing is obsolete.
 
-This document describes what `pkg/contract` (Go) and
-`pkg/harness/codefly_runnable` (Python) both implement.
-`codefly-dev/core#472` is freezing this framing as a shared contract; the two
-implementations here are this agent's proposal and its proof, and
-`pkg/contract/contract_test.go` fails if they drift apart.
+## Transport
 
-## Starting an invocation
+One invocation is one process, with package-relative argv and the unpacked
+artifact root as its working directory. No shell expansion is involved.
 
-| Variable | Meaning |
+| Environment variable | Value |
 | --- | --- |
-| `CODEFLY_RUNNABLE_REQUEST` | path of the request document the launcher wrote |
-| `CODEFLY_RUNNABLE_COMPLETION` | path the harness writes the completion to |
+| `CODEFLY__RUNNABLE_PROTOCOL` | `codefly.runnable/v1` |
+| `CODEFLY__RUNNABLE_INVOCATION` | absolute path to the launcher's request |
+| `CODEFLY__RUNNABLE_RESULT` | absolute path for the harness's atomic result |
 
-Both are required. Paths rather than pipes, because the same framing has to
-work for a native process the CLI supervises and for a Kubernetes Job that
-mounts its request and collects its completion from a volume.
-
-## Request
-
-```json
-{
-  "schema": "codefly.runnable.request/v1",
-  "protocol": "codefly.runnable/v1",
-  "invocation": { "invocation": "inv-7f3a", "intent": "intent-2b19", "effect": "effect-64c0" },
-  "runnable": { "name": "word-count", "module": "text", "workspace": "proof", "version": "0.1.0" },
-  "deadline": "2026-09-13T10:15:00Z",
-  "input": { "text": "one two three" }
-}
-```
-
-`invocation.invocation` is required; `intent` and `effect` carry the caller's
-own identifiers, so a handler records an effect under the identifier the caller
-will look it up by. `deadline` is required and has a time zone: an invocation
-never runs unbounded, and a harness never invents a bound.
-
-`input` is bounded by `execution.payload.max-input-bytes` (1 MiB by default).
-The payload is measured as compact UTF-8 JSON (no ASCII escaping), independently
-of the framing. The envelope has a separate 64 KiB bound. The file read is capped
-at the payload bound plus 64 KiB plus one sentinel byte, before parsing; the
-parsed input is then checked against its own payload bound. This framing remains
-a proposal for core #472; callers must not assume it is already a shared core API.
-
-## Completion
+The documents use proto3 JSON with snake_case field names. `input` and `output`
+are base64 encodings of exact UTF-8 JSON objects. Bounds apply to decoded bytes,
+including whitespace, and preserve signed 64-bit integers. The harness caps its
+request read at base64-expanded input capacity plus 64 KiB of framing.
 
 ```json
 {
-  "schema": "codefly.runnable.completion/v1",
   "protocol": "codefly.runnable/v1",
-  "invocation": { "invocation": "inv-7f3a", "intent": "intent-2b19", "effect": "effect-64c0" },
-  "runnable": { "name": "word-count", "module": "text", "workspace": "proof", "version": "0.1.0" },
-  "outcome": "completed",
-  "recovery": "recompute",
-  "output": { "count": 3 }
+  "runnable": {"name":"word-count","module":"proof","workspace":"proof","version":"0.0.1"},
+  "invocation_id": "inv-1",
+  "intent_id": "intent-1",
+  "issued_at": "2026-09-13T10:00:00Z",
+  "deadline": "2026-09-13T10:01:00Z",
+  "input": "eyJ0ZXh0Ijoib25lIHR3byB0aHJlZSJ9"
 }
 ```
 
-The completion repeats the identity the request carried: a completion that is
-not bound to the invocation it answers is not an answer. `output` is present
-only when the outcome is `completed`; every other outcome carries
-`error: {kind, message}` and no output. `recovery` repeats the declared effect
-semantics, so a caller resolving an uncertain outcome knows whether recomputing
-is allowed without re-reading the declaration.
+This input decodes to `{"text":"one two three"}`. An invocation must match the
+release embedded by the Builder. Standalone generation, which has no owning
+workspace, checks the declaration's name and version. `invocation_id` and
+`intent_id` are required and at most 128 characters. `effect_id` is required for
+`receipt` recovery and absent for `recompute`.
 
-The document is written to a temporary name and renamed into place, so a
-launcher reads the whole document or none of it.
+## Results and certainty
 
-## Outcomes
+A successful result for the example is:
 
-| Outcome | Exit | When |
-| --- | --- | --- |
-| `completed` | 0 | the handler returned output that satisfies the contract |
-| `invalid_input` | 64 | the request payload does not satisfy the input contract |
-| `invalid_output` | 65 | the handler returned something the output contract rejects, or over the output bound |
-| `failed` | 66 | the handler raised, exited, or could not be imported |
-| `timeout` | 67 | the deadline passed |
-| `interrupted` | 68 | the launcher signalled the invocation |
-| — | 69 | protocol error: no completion is written because none is bound to an identity |
+```json
+{"protocol":"codefly.runnable/v1","invocation_id":"inv-1","status":"SUCCEEDED","output":"eyJjb3VudCI6M30="}
+```
 
-**Exit zero alone is not success.** A launcher reads the completion and checks
-its schema, protocol and identity. A process that exits 0 without a readable,
-identity-bound completion is an *ambiguous* invocation, and `recovery` decides
-what may be done about it — never a silent retry of an external effect.
+The output decodes to `{"count":3}`. The harness validates the output schema and
+byte limit before atomically renaming the result into place. It reports a certain
+operation failure only when the handler explicitly raises:
 
-The first observed deadline or interruption retains precedence even when the
-handler catches it and fails during cleanup or returns invalid output. Imports
-run under the same timer and signal handlers as the function call; an already
-expired request never imports author code.
+```python
+from codefly_runnable import HandlerFailure
+raise HandlerFailure("unavailable", "The operation was refused")
+```
 
-## Logs
+This writes `status: FAILED` with `error: {code, message}` and no output. Use it
+only when the operation knows its effect's disposition. An unexpected exception,
+invalid payload, invalid return, import failure, timeout or interruption writes
+no result. Core therefore cannot mistake an unknown external effect for a known
+failure.
 
-`stdout` and `stderr` are the log streams. Each forwards at most 256 KiB per
-invocation plus one truncation marker; past the bound the harness writes one
-`[codefly] log truncated at N bytes` marker and drops the rest. Truncation
-never changes an outcome. The harness redirects file descriptors, so Python,
-native-library and inherited subprocess writes all traverse the bound. The
-launcher must additionally bound its log transport and supervise the entire
-process group, including descendants that outlive the harness. That ownership
-must be ratified in core #472.
+Because those outcomes write nothing, the harness removes any document at the
+result path before it reads the request, and refuses to start if it cannot. A
+document at that path is always this invocation's, so a launcher reusing the
+path cannot read an earlier attempt's result as this one's. The result is
+written 0644: which accounts may read it is the facility's choice. Exit codes
+are diagnostics, not portable completion outcomes:
 
-## The bounded schema profile
+| Exit | Diagnostic |
+| --- | --- |
+| 0 | validated success, unless author code bypassed the harness |
+| 64 | input schema rejection before author import |
+| 65 | invalid or oversized output, or result write failure |
+| 66 | explicit failure or unexpected handler/import exception |
+| 67 | harness deadline timer |
+| 68 | harness interruption |
+| 69 | invalid framing or environment |
 
-`object`, `array`, `string`, `integer` (signed 64-bit) and `boolean`, with
-`optional` (the key may be absent) and `nullable` (the value may be null)
-independent of each other. Validation refuses every coercion: `"3"` is not an
-integer, `3.0` is not an integer, `1` is not a boolean, and a key the contract
-does not declare is an error rather than an ignored extra. An explicitly empty
-object schema is valid and accepts exactly `{}`.
+The launcher calls core `Complete`. A valid result wins; otherwise a launcher
+termination reason takes precedence, then an invalid result, then a nonzero
+exit/signal, then exit zero with no result. A harness exit 67 by itself is
+`CRASHED`; the launcher must record its own deadline termination to classify
+`TIMED_OUT`. Only `SUCCEEDED` and explicit `FAILED` are certain.
 
-Errors name the path they were found at — `input.options.stop_words[1] must be
-a string, got integer` — because the caller that wrote the payload is the one
-who has to fix it.
+## Deadlines and logs
+
+For the native checkpoint, the harness preserves the original absolute deadline
+on the same host. Expired requests never import author code. The timer covers
+imports and the handler, and a swallowed signal cannot produce success. The
+launcher remains responsible for terminating the process group and descendants.
+Core #474 describes a clock-offset budget based on `deadline - issued_at`; the
+cross-host clock policy needs reconciliation before Kubernetes qualification.
+No distributed deadline or cancellation guarantee is claimed here.
+
+`stdout` and `stderr` carry diagnostics only. The harness's own terminal
+diagnostic is written after the handler's bound is released, so a handler that
+exhausts the budget cannot erase the single record of why an uncertain
+invocation ended. The generated harness uses the
+release's `max_log_bytes` (4 MiB by default), bounding Python, native-library and
+inherited subprocess writes. It may append one truncation marker. The launcher
+must independently enforce its exact transport bound and record truncation.
+
+## Payload schema
+
+`object`, `array`, `string`, signed 64-bit `integer` and `boolean` are supported.
+`optional` and `nullable` remain distinct. There is no coercion: `3.0` is not an
+integer, `1` is not a boolean, and undeclared keys are errors. Empty schemas accept
+exactly `{}`. Validation errors identify the offending input or output path.

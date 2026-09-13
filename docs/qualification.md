@@ -1,6 +1,6 @@
 # Qualification milestone — 2026-09-12
 
-**Historical baseline at `b4d5c12`.** The review changed the harness and native
+**Historical baseline at `b4d5c12`.** Its request/result commands use superseded framing; see [milestone 3](milestone_3_builder_grpc.md) and [the current protocol](protocol.md). The review changed the harness and native
 archive layout, so the digests and `.venv` command below identify the earlier
 experiment. See [milestone 2](milestone_2_review_fixes.md) for the corrected
 implementation and current checks. The earlier k3d runs remain debugging evidence.

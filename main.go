@@ -27,6 +27,7 @@ var manifest = shared.Must(resources.LoadFromFs[resources.Agent](shared.Embed(in
 
 func main() {
 	agents.Serve(agents.PluginRegistration{
-		Agent: runnableagent.New(manifest.Of(resources.RunnableAgent)),
+		Agent:   runnableagent.New(manifest.Of(resources.RunnableAgent)),
+		Builder: runnableagent.NewBuilder(manifest.Of(resources.RunnableAgent)),
 	})
 }

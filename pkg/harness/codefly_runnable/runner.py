@@ -27,6 +27,9 @@ from .protocol import (
     REQUEST_PATH_VARIABLE,
     TIMEOUT,
     ProtocolError,
+    HandlerFailure,
+    PROTOCOL,
+    PROTOCOL_VARIABLE,
     Request,
     completion_document,
     write_completion,
@@ -48,6 +51,7 @@ class _Outcome:
     output: dict[str, Any] | None = None
     error_kind: str = ""
     error_message: str = ""
+    failure: HandlerFailure | None = None
 
 
 class _Signals:
@@ -77,11 +81,17 @@ def main() -> int:
     root = Path(__file__).resolve().parent.parent
     try:
         contract = Contract.load(root / CONTRACT_FILE)
+        if _required(PROTOCOL_VARIABLE) != PROTOCOL:
+            raise ProtocolError("unsupported protocol environment")
         request_path = _required(REQUEST_PATH_VARIABLE)
         completion_path = _required(COMPLETION_PATH_VARIABLE)
+        # A result document is this run's or it is nothing. An uncertain
+        # outcome writes none, so an earlier attempt's document left at the
+        # same path would be read as this invocation's proven result.
+        _clear(completion_path)
         with open(request_path, "rb") as request_file:
-            raw = request_file.read(contract.max_input_bytes + MAX_ENVELOPE_BYTES + 1)
-        request = Request.parse(raw, contract.max_input_bytes)
+            raw = request_file.read(4 * ((contract.max_input_bytes + 2) // 3) + MAX_ENVELOPE_BYTES + 1)
+        request = Request.parse(raw, contract.max_input_bytes, contract.recovery, contract.runnable)
     except (OSError, KeyError, ValueError, ProtocolError) as err:
         # Nothing here is bound to an invocation identity, so there is no
         # completion to write: the launcher reads the exit code alone.
@@ -91,35 +101,45 @@ def main() -> int:
     with bounded_logs(contract.max_log_bytes):
         result = _invoke(contract, request, root)
 
-    document = completion_document(
-        identity=request.identity,
-        runnable=request.runnable,
-        outcome=result.outcome,
-        recovery=contract.recovery,
-        output=result.output,
-        error_kind=result.error_kind,
-        error_message=result.error_message,
-    )
+    # The harness reports itself only after the handler's log budget is
+    # released. An uncertain outcome writes no result document, so this line is
+    # the single record of why the invocation ended; inside the bound a chatty
+    # handler would spend the budget first and evict it.
+    #
+    # Only a validated success or the operation's explicit failure is certain.
+    # A crash, invalid payload or interruption leaves no result for core to
+    # misread as a known disposition of an external effect.
+    if result.outcome != COMPLETED and result.failure is None:
+        print(f"[codefly] {result.outcome}: {result.error_message}", file=sys.stderr)
+        return EXIT_CODES[result.outcome]
     try:
+        document = completion_document(identity=request.identity, output=result.output, failure=result.failure)
         write_completion(completion_path, document, contract.max_output_bytes)
-    except ProtocolError as err:
-        document = completion_document(
-            identity=request.identity,
-            runnable=request.runnable,
-            outcome=INVALID_OUTPUT,
-            recovery=contract.recovery,
-            error_kind="payload-bound",
-            error_message=str(err),
-        )
-        write_completion(completion_path, document, contract.max_output_bytes)
+    except (OSError, ValueError, ProtocolError) as err:
+        print(f"[codefly] invalid_output: {err}", file=sys.stderr)
         return EXIT_CODES[INVALID_OUTPUT]
     return EXIT_CODES[result.outcome]
+
+
+def _clear(path: str) -> None:
+    """Remove a document left at the result path by an earlier attempt.
+
+    A path the harness cannot clear is one it cannot own, so the invocation
+    refuses to start rather than run toward a result it may not be able to
+    report.
+    """
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
 
 
 def _required(variable: str) -> str:
     value = os.environ.get(variable)
     if not value:
         raise KeyError(f"{variable} is required: the launcher chooses both document paths")
+    if variable != PROTOCOL_VARIABLE and not os.path.isabs(value):
+        raise ProtocolError(f"{variable} must be an absolute path")
     return value
 
 
@@ -189,6 +209,10 @@ def _run(
         return _Outcome(
             INTERRUPTED, error_kind="signal", error_message="the invocation was interrupted"
         )
+    except HandlerFailure as err:
+        if stage == "handler":
+            return _Outcome(FAILED, failure=err)
+        return _Outcome(FAILED, error_message=_describe(err))
     except BaseException as err:  # noqa: BLE001 — a handler exit is a failure, not a success
         return _Outcome(FAILED, error_kind=stage, error_message=_describe(err))
     finally:

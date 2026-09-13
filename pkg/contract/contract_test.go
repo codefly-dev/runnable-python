@@ -6,47 +6,46 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/codefly-dev/core/resources"
+	corerunnable "github.com/codefly-dev/core/runnable"
+
 	"github.com/codefly-dev/runnable-python/pkg/contract"
 	"github.com/codefly-dev/runnable-python/pkg/harness"
 )
 
-// TestTheFramingIsOneContract guards the seam: the Go constants a launcher
-// reads and the Python constants the harness enforces are two implementations
-// of docs/protocol.md, and they drift silently unless something compares them.
+// TestTheFramingIsOneContract guards the constants this repository spells
+// twice: once in Go, against core, and once as a literal in the embedded
+// Python harness. Nothing at build time connects the two, so a core rename
+// would otherwise reach the fleet as every invocation exiting 69.
 func TestTheFramingIsOneContract(t *testing.T) {
 	protocol := source(t, "codefly_runnable/protocol.py")
 
 	for _, declaration := range []string{
-		fmt.Sprintf("PROTOCOL = %q", contract.Protocol),
-		fmt.Sprintf("REQUEST_SCHEMA = %q", contract.RequestSchema),
-		fmt.Sprintf("COMPLETION_SCHEMA = %q", contract.CompletionSchema),
-		fmt.Sprintf("REQUEST_PATH_VARIABLE = %q", contract.RequestPathVariable),
-		fmt.Sprintf("COMPLETION_PATH_VARIABLE = %q", contract.CompletionPathVariable),
-		fmt.Sprintf("COMPLETED = %q", contract.OutcomeCompleted),
-		fmt.Sprintf("INVALID_INPUT = %q", contract.OutcomeInvalidInput),
-		fmt.Sprintf("INVALID_OUTPUT = %q", contract.OutcomeInvalidOutput),
-		fmt.Sprintf("FAILED = %q", contract.OutcomeFailed),
-		fmt.Sprintf("TIMEOUT = %q", contract.OutcomeTimeout),
-		fmt.Sprintf("INTERRUPTED = %q", contract.OutcomeInterrupted),
+		// Core owns the protocol name and the three framing variables.
+		fmt.Sprintf("PROTOCOL = %q", resources.RunnableProtocolV1),
+		fmt.Sprintf("PROTOCOL_VARIABLE = %q", corerunnable.EnvProtocol),
+		fmt.Sprintf("REQUEST_PATH_VARIABLE = %q", corerunnable.EnvInvocationPath),
+		fmt.Sprintf("COMPLETION_PATH_VARIABLE = %q", corerunnable.EnvResultPath),
+		// The harness's fallback log bound must be core's declared default.
+		fmt.Sprintf("DEFAULT_MAX_LOG_BYTES = %d * 1024 * 1024", resources.DefaultRunnableLogBytes/(1024*1024)),
 		fmt.Sprintf("EXIT_PROTOCOL = %d", contract.ExitProtocol),
-		fmt.Sprintf("DEFAULT_MAX_LOG_BYTES = %d * 1024", contract.DefaultMaxLogBytes/1024),
-		fmt.Sprintf("MAX_ENVELOPE_BYTES = %d * 1024", contract.MaxEnvelopeBytes/1024),
 	} {
 		if !strings.Contains(protocol, declaration) {
 			t.Errorf("the harness does not declare %s", declaration)
 		}
 	}
 
-	for outcome, code := range map[string]int{
-		contract.OutcomeCompleted:     contract.ExitCompleted,
-		contract.OutcomeInvalidInput:  contract.ExitInvalidInput,
-		contract.OutcomeInvalidOutput: contract.ExitInvalidOutput,
-		contract.OutcomeFailed:        contract.ExitFailed,
-		contract.OutcomeTimeout:       contract.ExitTimeout,
-		contract.OutcomeInterrupted:   contract.ExitInterrupted,
+	// This agent's Go constants are what a caller compares an observed exit
+	// against; the harness is what produces it.
+	for name, code := range map[string]int{
+		"COMPLETED":      contract.ExitCompleted,
+		"INVALID_INPUT":  contract.ExitInvalidInput,
+		"INVALID_OUTPUT": contract.ExitInvalidOutput,
+		"FAILED":         contract.ExitFailed,
+		"TIMEOUT":        contract.ExitTimeout,
+		"INTERRUPTED":    contract.ExitInterrupted,
 	} {
-		mapping := fmt.Sprintf("%s: %d,", strings.ToUpper(outcome), code)
-		if !strings.Contains(protocol, mapping) {
+		if mapping := fmt.Sprintf("%s: %d", name, code); !strings.Contains(protocol, mapping) {
 			t.Errorf("the harness does not map %s", mapping)
 		}
 	}
@@ -58,6 +57,13 @@ func TestTheFramingIsOneContract(t *testing.T) {
 	if runner := source(t, "codefly_runnable/runner.py"); !strings.Contains(
 		runner, "getattr(module, contract.handler_attribute") {
 		t.Error("the harness no longer resolves the handler through the generated contract")
+	}
+}
+
+// TestTheProtocolIsCoresProtocol keeps this agent's own alias honest.
+func TestTheProtocolIsCoresProtocol(t *testing.T) {
+	if contract.Protocol != resources.RunnableProtocolV1 {
+		t.Fatalf("protocol = %q, core declares %q", contract.Protocol, resources.RunnableProtocolV1)
 	}
 }
 

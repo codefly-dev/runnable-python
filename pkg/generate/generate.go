@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 
+	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
 	"github.com/codefly-dev/core/resources"
 
 	"github.com/codefly-dev/runnable-python/pkg/contract"
@@ -53,6 +54,13 @@ func Scaffold(runnable *resources.Runnable, dir string) error {
 // harness enforces and the harness itself. Regenerating an unchanged
 // declaration produces the same bytes.
 func Generate(runnable *resources.Runnable, dir string) error {
+	return GenerateForRelease(runnable, dir, nil)
+}
+
+// GenerateForRelease binds the harness to the workspace-resolved release.
+// Standalone generation checks the declaration's name and version; the Builder
+// always supplies the complete identity resolved during Load.
+func GenerateForRelease(runnable *resources.Runnable, dir string, identity *basev0.RunnableIdentity) error {
 	module, err := HandlerModule(runnable.Entrypoint.Handler)
 	if err != nil {
 		return err
@@ -67,7 +75,11 @@ func Generate(runnable *resources.Runnable, dir string) error {
 	if err := harness.Write(generated); err != nil {
 		return fmt.Errorf("write harness: %w", err)
 	}
-	document, err := contract.Generate(runnable, module).Encode()
+	generatedContract := contract.Generate(runnable, module)
+	if identity != nil {
+		generatedContract.Runnable = map[string]string{"name": identity.GetName(), "module": identity.GetModule(), "workspace": identity.GetWorkspace(), "version": identity.GetVersion()}
+	}
+	document, err := generatedContract.Encode()
 	if err != nil {
 		return err
 	}
@@ -94,29 +106,29 @@ func HandlerModule(handler string) (string, error) {
 	return strings.Join(segments, "."), nil
 }
 
-// Confine resolves a declared runnable-relative path inside dir and refuses a
-// target outside it, symlinks included: core validates the declared spelling,
-// but whoever opens the file is what decides what content is trusted.
-func Confine(dir string, relative string) (string, error) {
-	root, err := filepath.EvalSymlinks(dir)
-	if err != nil {
-		return "", fmt.Errorf("resolve runnable directory: %w", err)
-	}
-	target := filepath.Join(root, relative)
-	ancestor := target
+// Resolve returns where target really is: symlinks resolved through the part
+// of the path that exists, with the components that do not yet exist appended
+// to it. Every containment check runs on this form, because the spelling a
+// caller supplies says nothing about where a symlink in it leads.
+//
+// A dangling symlink is refused rather than treated as a missing directory:
+// creating through one writes wherever it points.
+func Resolve(target string) (string, error) {
+	ancestor := filepath.Clean(target)
 	var missing []string
-	var resolved string
 	for {
-		resolved, err = filepath.EvalSymlinks(ancestor)
+		resolved, err := filepath.EvalSymlinks(ancestor)
 		if err == nil {
-			break
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return resolved, nil
 		}
 		if !os.IsNotExist(err) {
 			return "", err
 		}
-		// A dangling symlink is not a missing directory we can safely create.
 		if _, statErr := os.Lstat(ancestor); statErr == nil {
-			return "", fmt.Errorf("path %q contains a dangling symlink", relative)
+			return "", fmt.Errorf("path %q contains a dangling symlink", target)
 		}
 		missing = append(missing, filepath.Base(ancestor))
 		parent := filepath.Dir(ancestor)
@@ -125,10 +137,28 @@ func Confine(dir string, relative string) (string, error) {
 		}
 		ancestor = parent
 	}
-	for i := len(missing) - 1; i >= 0; i-- {
-		resolved = filepath.Join(resolved, missing[i])
+}
+
+// Within says whether path is strictly inside directory. Both must already be
+// resolved: a prefix test on unresolved paths proves nothing.
+func Within(path string, directory string) bool {
+	separator := string(filepath.Separator)
+	return strings.HasPrefix(path, strings.TrimSuffix(directory, separator)+separator)
+}
+
+// Confine resolves a declared runnable-relative path inside dir and refuses a
+// target outside it, symlinks included: core validates the declared spelling,
+// but whoever opens the file is what decides what content is trusted.
+func Confine(dir string, relative string) (string, error) {
+	root, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", fmt.Errorf("resolve runnable directory: %w", err)
 	}
-	if resolved != root && !strings.HasPrefix(resolved, root+string(filepath.Separator)) {
+	resolved, err := Resolve(filepath.Join(root, relative))
+	if err != nil {
+		return "", err
+	}
+	if resolved != root && !Within(resolved, root) {
 		return "", fmt.Errorf("path %q resolves outside the runnable directory", relative)
 	}
 	return resolved, nil
