@@ -28,7 +28,7 @@ func TestBuilderPackagesThePreparedSnapshotOverGRPC(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv(resources.CodeflyHomeEnv, filepath.Join(root, "home"))
 	t.Setenv(manager.AgentSourceEnv, "local")
-	agent, err := resources.ParseAgent(ctx, resources.RunnableAgent, "codefly.dev/python:0.0.1")
+	agent, err := resources.ParseAgent(ctx, resources.RunnableAgent, "codefly.dev/python:0.0.2")
 	require.NoError(t, err)
 	binary, err := agent.Path(ctx)
 	require.NoError(t, err)
@@ -83,6 +83,13 @@ func TestBuilderPackagesThePreparedSnapshotOverGRPC(t *testing.T) {
 	prepared, err := client.RunnableBuildInputs(ctx, &builderv0.RunnableBuildInputsRequest{OutputDirectory: filepath.Join(root, "prepared")})
 	require.NoError(t, err)
 	require.Equal(t, builderv0.RunnableBuildInputsStatus_SUCCESS, prepared.GetState().GetState())
+
+	// Preparing again into the caller's populated directory is refused by name
+	// rather than from inside preparation, and the snapshot already prepared
+	// survives the refusal: the Package below still emits it.
+	_, err = client.RunnableBuildInputs(ctx, &builderv0.RunnableBuildInputsRequest{OutputDirectory: filepath.Join(root, "prepared")})
+	require.Equal(t, codes.AlreadyExists, status.Code(err))
+
 	write(t, filepath.Join(r.Dir(), "handler.py"), "def handle(context, input):\n    return {\"count\": 999}\n")
 	_, err = client.Package(ctx, &builderv0.PackageRequest{Targets: []*builderv0.PackageTarget{{Os: "other", Architecture: runtime.GOARCH}}, OutputDirectory: filepath.Join(root, "unsupported")})
 	require.Equal(t, codes.Unimplemented, status.Code(err))
@@ -106,7 +113,8 @@ func TestBuilderPackagesThePreparedSnapshotOverGRPC(t *testing.T) {
 	unpack(t, response.GetArtifacts()[0].GetPath(), installed)
 	result := invoke(t, installed, pkg.GetArtifacts()[0].GetCommand(), pkg, map[string]any{"text": "one two three"})
 	require.Equal(t, 0, result.exit, result.stderr)
-	require.Equal(t, 3, result.count(t), "the package must execute the prepared handler")
+	require.Equal(t, 3, result.count(t),
+		"the package must execute the prepared handler, so the refused retry discarded no snapshot")
 
 	write(t, filepath.Join(root, "prepared", "runnable", "handler.py"), "def handle(context, input): return {\"count\": 888}\n")
 	_, err = client.Package(ctx, &builderv0.PackageRequest{OutputDirectory: filepath.Join(root, "tampered")})

@@ -58,7 +58,9 @@ class Runnable:
     ) -> Invocation:
         request = self.generated / "request.json"
         completion = self.generated / "completion.json"
-        completion.unlink(missing_ok=True)
+        # Deliberately not cleared here: clearing a stale result is the
+        # harness's own obligation, and doing it for it would hide a document
+        # surviving into a run that reports none.
         if raw_request is None:
             deadline = datetime.now(timezone.utc) + timedelta(seconds=deadline_in)
             document = {

@@ -62,7 +62,14 @@ This writes `status: FAILED` with `error: {code, message}` and no output. Use it
 only when the operation knows its effect's disposition. An unexpected exception,
 invalid payload, invalid return, import failure, timeout or interruption writes
 no result. Core therefore cannot mistake an unknown external effect for a known
-failure. Exit codes are diagnostics, not portable completion outcomes:
+failure.
+
+Because those outcomes write nothing, the harness removes any document at the
+result path before it reads the request, and refuses to start if it cannot. A
+document at that path is always this invocation's, so a launcher reusing the
+path cannot read an earlier attempt's result as this one's. The result is
+written 0644: which accounts may read it is the facility's choice. Exit codes
+are diagnostics, not portable completion outcomes:
 
 | Exit | Diagnostic |
 | --- | --- |
@@ -90,7 +97,10 @@ Core #474 describes a clock-offset budget based on `deadline - issued_at`; the
 cross-host clock policy needs reconciliation before Kubernetes qualification.
 No distributed deadline or cancellation guarantee is claimed here.
 
-`stdout` and `stderr` carry diagnostics only. The generated harness uses the
+`stdout` and `stderr` carry diagnostics only. The harness's own terminal
+diagnostic is written after the handler's bound is released, so a handler that
+exhausts the budget cannot erase the single record of why an uncertain
+invocation ended. The generated harness uses the
 release's `max_log_bytes` (4 MiB by default), bounding Python, native-library and
 inherited subprocess writes. It may append one truncation marker. The launcher
 must independently enforce its exact transport bound and record truncation.

@@ -63,7 +63,6 @@ def handle(context, input):
     assert result.exit_code == 64
     assert result.completion is None
     assert "must be a boolean" in result.stderr
-    assert result.completion is None
 
 
 def test_invalid_output_is_reported_as_its_own_outcome(runnable):
@@ -111,7 +110,6 @@ def handle(context, input):
     assert result.exit_code == 66
     assert result.completion is None
     assert "upstream refused" in result.stderr
-    assert result.completion is None
 
 
 def test_an_exiting_handler_is_a_failure_not_a_success(runnable):
@@ -183,7 +181,6 @@ def handle(context, input):
     result = unit.invoke({"text": "a b", "double": False}, deadline_in=1.0)
 
     assert result.exit_code == 67
-    assert result.completion is None
     assert result.completion is None
 
 
@@ -300,7 +297,6 @@ def handle(context, input):
     result = unit.invoke({})
 
     assert result.exit_code == 65
-    assert result.completion is None
     assert result.completion is None
 
 
@@ -516,3 +512,76 @@ def handle(context, input):
     result = unit.invoke({}, request_overrides={"effect_id": ""})
     assert result.exit_code == 69
     assert result.completion is None
+
+
+def test_a_chatty_handler_cannot_evict_the_reason_it_failed(runnable):
+    """An uncertain outcome writes no result, so stderr carries the only reason.
+
+    The handler must not be able to spend the log budget and push it out.
+    """
+    unit = runnable('''
+import sys
+def handle(context, input):
+    sys.stderr.write("N" * 40000)
+    return {"count": "not-an-integer"}
+''', **COUNT_CONTRACT, **{"max-log-bytes": 1024})
+
+    result = unit.invoke({"text": "a b", "double": False})
+
+    assert result.exit_code == 65
+    assert result.completion is None
+    assert "log truncated at 1024 bytes" in result.stderr
+    assert "output.count must be an integer" in result.stderr
+
+
+def test_an_uncertain_outcome_clears_an_earlier_result(runnable):
+    """A result document is this run's or it is nothing.
+
+    A launcher that reuses the result path would otherwise read the previous
+    attempt's SUCCEEDED document as this timed-out invocation's proven result.
+    """
+    unit = runnable('''
+import os, time
+def handle(context, input):
+    if os.environ.get("SLOW"):
+        time.sleep(30)
+    return {"count": 1}
+''', **COUNT_CONTRACT)
+
+    first = unit.invoke({"text": "a", "double": False})
+    assert first.exit_code == 0, first.stderr
+    assert first.completion["status"] == "SUCCEEDED"
+
+    second = unit.invoke(
+        {"text": "a", "double": False}, deadline_in=1.0, environment={"SLOW": "1"}
+    )
+
+    assert second.exit_code == 67
+    assert second.completion is None
+    assert not (unit.generated / "completion.json").exists()
+
+
+def test_invalid_framing_clears_an_earlier_result(runnable):
+    """Framing is refused before the request is read, so the stale document
+    must already be gone by then."""
+    unit = runnable(COUNT_HANDLER, **COUNT_CONTRACT)
+
+    assert unit.invoke({"text": "a", "double": False}).exit_code == 0
+    result = unit.invoke({}, request_overrides={"protocol": "codefly.runnable/v2"})
+
+    assert result.exit_code == 69
+    assert result.completion is None
+    assert not (unit.generated / "completion.json").exists()
+
+
+def test_the_result_is_readable_by_the_launcher(runnable):
+    """The launcher that reads the result may not be the account that wrote it."""
+    import stat
+
+    unit = runnable(COUNT_HANDLER, **COUNT_CONTRACT)
+
+    result = unit.invoke({"text": "a b", "double": False})
+
+    assert result.exit_code == 0, result.stderr
+    mode = (unit.generated / "completion.json").stat().st_mode
+    assert stat.S_IMODE(mode) == 0o644

@@ -36,6 +36,10 @@ func (a *Agent) GetAgentInformation(_ context.Context, _ *agentv0.AgentInformati
 	info := services.Advertisement{
 		CapabilityOnly: true,
 		Backends: runners.BackendSupport{
+			// Deliberately not core's runners/python.HasUVRuntime, which is
+			// identical: importing that package pulls a TOML dependency in for
+			// service runtime selection this agent never does. What is
+			// advertised here is exactly what prepare.Prepare requires.
 			Local:  func() bool { _, err := exec.LookPath("uv"); return err == nil },
 			Docker: false,
 		},

@@ -23,7 +23,9 @@ published by this work. Core #474 must settle before coordinated fleet release.
 - [gRPC regression](../builder_grpc_test.go): builds and starts the real agent,
   verifies Builder capability, creates and packages over gRPC, edits live source,
   relocates and invokes the prepared archive. It also checks invalid target,
-  source/symlink overlap, snapshot tampering and failed-Load state clearing.
+  source/symlink overlap, snapshot tampering, failed-Load state clearing, and
+  that preparing again into an occupied output directory is refused without
+  discarding the snapshot already prepared.
 - [Native qualification](../qualification_test.go): core encodes the invocation
   and validates/classifies the real Python result; locked third-party dependencies
   and the bundled interpreter survive removal of the preparation environment.
@@ -41,7 +43,7 @@ GOWORK=off go test -race ./...
 uv run --with pytest --python 3.12 pytest -q pkg/harness/tests
 ```
 
-The native Go and gRPC tests pass on macOS/arm64. The harness has 57 passing real
+The native Go and gRPC tests pass on macOS/arm64. The harness has 61 passing real
 process/schema cases. The CLI companion integration creates through the actual
 CLI, packages through this agent, removes source/prepared files, and proves:
 

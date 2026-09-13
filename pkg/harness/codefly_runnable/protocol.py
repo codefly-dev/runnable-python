@@ -17,6 +17,8 @@ REQUEST_PATH_VARIABLE = "CODEFLY__RUNNABLE_INVOCATION"
 COMPLETION_PATH_VARIABLE = "CODEFLY__RUNNABLE_RESULT"
 DEFAULT_MAX_LOG_BYTES = 4 * 1024 * 1024
 MAX_ENVELOPE_BYTES = 64 * 1024
+# The result is readable by the launcher that started this process.
+RESULT_MODE = 0o644
 
 # Internal diagnostics. These are not RunnableCompletion outcomes.
 COMPLETED = "completed"
@@ -170,6 +172,11 @@ def write_completion(path: str, document: dict, max_output_bytes: int) -> None:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        # The rename carries the staging file's mode onto the result, and a
+        # temporary file is private to this process. Whether a launcher reads
+        # the result under another account is the facility's choice, not one
+        # the harness should make for it by leaving the mode at 0600.
+        os.chmod(staging, RESULT_MODE)
         os.replace(staging, path)
     finally:
         if staging and os.path.exists(staging):
