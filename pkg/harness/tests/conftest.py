@@ -122,6 +122,7 @@ def runnable(tmp_path):
             "input": input or {},
             "output": output or {},
             "recovery": "recompute",
+            "cancellation": "signal",
             "max-input-bytes": 65536,
             "max-output-bytes": 65536,
             "max-log-bytes": 262144,

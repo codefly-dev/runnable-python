@@ -85,8 +85,8 @@ def main() -> int:
             raise ProtocolError("unsupported protocol environment")
         request_path = _required(REQUEST_PATH_VARIABLE)
         completion_path = _required(COMPLETION_PATH_VARIABLE)
-        # A result document is this run's or it is nothing. An uncertain
-        # outcome writes none, so an earlier attempt's document left at the
+        # A result document is this run's or it is nothing. Some uncertain
+        # outcomes write none, so an earlier attempt's document left at the
         # same path would be read as this invocation's proven result.
         _clear(completion_path)
         with open(request_path, "rb") as request_file:
@@ -94,7 +94,7 @@ def main() -> int:
         request = Request.parse(raw, contract.max_input_bytes, contract.recovery, contract.runnable)
     except (OSError, KeyError, ValueError, ProtocolError) as err:
         # Nothing here is bound to an invocation identity, so there is no
-        # completion to write: the launcher reads the exit code alone.
+        # result to write: the launcher reads the exit code alone.
         print(f"[codefly] {err}", file=sys.stderr)
         return EXIT_PROTOCOL
 
@@ -102,18 +102,19 @@ def main() -> int:
         result = _invoke(contract, request, root)
 
     # The harness reports itself only after the handler's log budget is
-    # released. An uncertain outcome writes no result document, so this line is
-    # the single record of why the invocation ended; inside the bound a chatty
-    # handler would spend the budget first and evict it.
+    # released. Inside the bound a chatty handler would spend the budget first
+    # and evict the diagnostic explaining why the invocation ended.
     #
     # Only a validated success or the operation's explicit failure is certain.
-    # A crash, invalid payload or interruption leaves no result for core to
-    # misread as a known disposition of an external effect.
-    if result.outcome != COMPLETED and result.failure is None:
+    # An INTERRUPTED result reports a handled signal while leaving the effect
+    # uncertain. Crashes and invalid payloads still write no result.
+    if result.outcome != COMPLETED:
         print(f"[codefly] {result.outcome}: {result.error_message}", file=sys.stderr)
+    if result.outcome not in (COMPLETED, INTERRUPTED) and result.failure is None:
         return EXIT_CODES[result.outcome]
     try:
-        document = completion_document(identity=request.identity, output=result.output, failure=result.failure)
+        document = completion_document(identity=request.identity, output=result.output,
+                                       failure=result.failure, interrupted=result.outcome == INTERRUPTED)
         write_completion(completion_path, document, contract.max_output_bytes)
     except (OSError, ValueError, ProtocolError) as err:
         print(f"[codefly] invalid_output: {err}", file=sys.stderr)
@@ -192,9 +193,10 @@ def _run(
 ) -> _Outcome:
     previous = {
         signal.SIGALRM: signal.signal(signal.SIGALRM, signals.deadline),
-        signal.SIGTERM: signal.signal(signal.SIGTERM, signals.interruption),
-        signal.SIGINT: signal.signal(signal.SIGINT, signals.interruption),
     }
+    if contract.cancellation == "signal":
+        for number in (signal.SIGTERM, signal.SIGINT):
+            previous[number] = signal.signal(number, signals.interruption)
     signal.setitimer(signal.ITIMER_REAL, remaining)
     stage = "handler-import"
     try:

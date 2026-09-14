@@ -199,7 +199,8 @@ def handle(context, input):
     result = unit.invoke({"text": "a b", "double": False}, interrupt_after=1.0)
 
     assert result.exit_code == 68
-    assert result.completion is None
+    assert result.completion["status"] == "INTERRUPTED"
+    assert "output" not in result.completion
 
 
 def test_a_swallowed_interruption_is_still_interrupted(runnable):
@@ -220,7 +221,8 @@ def handle(context, input):
     result = unit.invoke({"text": "a b", "double": False}, interrupt_after=1.0)
 
     assert result.exit_code == 68
-    assert result.completion is None
+    assert result.completion["status"] == "INTERRUPTED"
+    assert "output" not in result.completion
 
 
 def test_exit_zero_without_a_completion_leaves_nothing_to_read(runnable):
@@ -446,7 +448,8 @@ def handle(context, input):
 ''')
     result = unit.invoke({}, interrupt_after=0.3)
     assert result.exit_code == 68
-    assert result.completion is None
+    assert result.completion["status"] == "INTERRUPTED"
+    assert "output" not in result.completion
 
 
 def test_file_descriptor_and_subprocess_logs_are_bounded(runnable):
@@ -480,7 +483,6 @@ def handle(context, input):
 
 
 @pytest.mark.parametrize("overrides", [
-    {"effect_id": "foreign-effect"},
     {"intent_id": ""},
     {"invocation_id": "x" * 129},
     {"runnable": dict(RUNNABLE, version="9.0.0")},
@@ -585,3 +587,25 @@ def test_the_result_is_readable_by_the_launcher(runnable):
     assert result.exit_code == 0, result.stderr
     mode = (unit.generated / "completion.json").stat().st_mode
     assert stat.S_IMODE(mode) == 0o644
+
+
+def test_recompute_accepts_an_effect_identity(runnable):
+    unit = runnable("""
+def handle(context, input):
+    return {"effect": context.invocation.effect}
+""", output={"fields": [{"name": "effect", "type": "string"}]})
+    result = unit.invoke({}, request_overrides={"effect_id": "shared-effect"})
+    assert result.exit_code == 0
+    assert result.completion["output"] == {"effect": "shared-effect"}
+
+
+def test_cancellation_none_does_not_claim_a_handled_signal(runnable):
+    unit = runnable("""
+import time
+def handle(context, input):
+    time.sleep(30)
+    return {}
+""", cancellation="none")
+    result = unit.invoke({}, interrupt_after=0.5)
+    assert result.exit_code == -15
+    assert result.completion is None

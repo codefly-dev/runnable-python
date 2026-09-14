@@ -2,7 +2,7 @@
 
 The Codefly language agent for typed, finite Python operations: generate a handler, prepare its dependencies, and produce identified native packages and container build recipes.
 
-**Status: native authoring and packaging are implemented through the real Builder gRPC lifecycle using core #474's shared handoff. No agent version is released yet.** [Milestone 3](docs/milestone_3_builder_grpc.md) records this checkpoint; [issue #1](https://github.com/codefly-dev/runnable-python/issues/1) still tracks durable native and Kubernetes execution.
+**Status: native authoring and packaging are implemented through the real Builder gRPC lifecycle on core v0.3.29.** Agent 0.0.2 includes the shared invocation/result framing and signal-cancellation contract; published binaries appear on the [releases page](https://github.com/codefly-dev/runnable-python/releases). [Milestone 3](docs/milestone_3_builder_grpc.md) records the Builder checkpoint; [issue #1](https://github.com/codefly-dev/runnable-python/issues/1) still tracks durable native and Kubernetes execution.
 
 The review corrections and current validation are recorded in [milestone 2](docs/milestone_2_review_fixes.md). Earlier image/k3d observations are historical and do not qualify the Codefly/Orchestration path.
 

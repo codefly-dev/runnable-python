@@ -22,6 +22,7 @@ class Contract:
     input: Schema
     output: Schema
     recovery: str
+    cancellation: str
     max_input_bytes: int
     max_output_bytes: int
     max_log_bytes: int
@@ -44,6 +45,7 @@ class Contract:
             input=Schema.parse(document.get("input")),
             output=Schema.parse(document.get("output")),
             recovery=document["recovery"],
+            cancellation=document.get("cancellation", "none"),
             runnable=document["runnable"],
             max_input_bytes=int(document["max-input-bytes"]),
             max_output_bytes=int(document["max-output-bytes"]),
