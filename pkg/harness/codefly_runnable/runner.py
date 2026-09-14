@@ -85,8 +85,8 @@ def main() -> int:
             raise ProtocolError("unsupported protocol environment")
         request_path = _required(REQUEST_PATH_VARIABLE)
         completion_path = _required(COMPLETION_PATH_VARIABLE)
-        # A result document is this run's or it is nothing. An uncertain
-        # outcome writes none, so an earlier attempt's document left at the
+        # A result document is this run's or it is nothing. Some uncertain
+        # outcomes write none, so an earlier attempt's document left at the
         # same path would be read as this invocation's proven result.
         _clear(completion_path)
         with open(request_path, "rb") as request_file:
