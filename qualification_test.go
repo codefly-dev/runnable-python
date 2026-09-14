@@ -341,13 +341,14 @@ func invoke(t *testing.T, root string, argv []string, pkg *basev0.RunnablePackag
 	require.NotNil(t, process.ProcessState, "start process: %v", runErr)
 	result := invocation{exit: process.ProcessState.ExitCode(), stdout: stdout.String(), stderr: stderr.String()}
 	recorded, err := os.ReadFile(resultPath)
+	present := err == nil
 	if err != nil {
 		require.True(t, os.IsNotExist(err), "%v", err)
 	}
-	observed := corerunnable.Observation{Result: recorded, ExitCode: int32(result.exit), StartedAt: started, EndedAt: time.Now()}
+	observed := corerunnable.Observation{ResultPresent: present, Result: recorded, ExitCode: int32(result.exit), StartedAt: started, EndedAt: time.Now()}
 	result.classified, err = corerunnable.Complete(inv, pkg, observed)
 	require.NoError(t, err)
-	if recorded != nil {
+	if present {
 		parsed, err := corerunnable.ParseResult(recorded, inv, pkg)
 		require.NoError(t, err, string(recorded))
 		result.completion = map[string]any{}

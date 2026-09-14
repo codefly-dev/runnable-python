@@ -38,6 +38,8 @@ github.com/cloudflare/circl v1.6.3 h1:9GPOhQGF9MCYUeXyMYlqTR6a5gTrgR/fBLXvUgtVcg
 github.com/cloudflare/circl v1.6.3/go.mod h1:2eXP6Qfat4O/Yhh8BznvKnJ+uzEoTQ6jVKJRn81BiS4=
 github.com/codefly-dev/core v0.3.28-0.20260913013542-b3470f0096cd h1:SuB+IbQhgWiybxXxhSc2IzXiqTIXl21bpIa6roVpuBY=
 github.com/codefly-dev/core v0.3.28-0.20260913013542-b3470f0096cd/go.mod h1:s3e5uut1GseXvtmBanN9J6wcfnTSFTJfAolIMef+41w=
+github.com/codefly-dev/core v0.3.28-0.20260913182029-34d35397ac69 h1:flynzbZBFtxWL6zhV/Qdsa8W0SEQmKppQafTcYNNbq4=
+github.com/codefly-dev/core v0.3.28-0.20260913182029-34d35397ac69/go.mod h1:s3e5uut1GseXvtmBanN9J6wcfnTSFTJfAolIMef+41w=
 github.com/codefly-dev/gortk v0.2.0 h1:7bOlS5valYz2zil+fZctQNcPCYBcPj86abcw9N8h1hQ=
 github.com/codefly-dev/gortk v0.2.0/go.mod h1:dDWUMFgAP063OCGhTEpV7FFUj9+zTcxxO/nV80VKEwg=
 github.com/containerd/errdefs v1.0.0 h1:tg5yIfIlQIrxYtu9ajqY42W3lpS19XqdxRQeEwYG8PI=
