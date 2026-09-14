@@ -31,13 +31,14 @@ const HandlerAttribute = "handle"
 
 // Generated is the contract document the agent writes beside the harness.
 type Generated struct {
-	Schema   string            `json:"schema"`
-	Protocol string            `json:"protocol"`
-	Handler  Handler           `json:"handler"`
-	Input    Schema            `json:"input"`
-	Output   Schema            `json:"output"`
-	Recovery string            `json:"recovery"`
-	Runnable map[string]string `json:"runnable"`
+	Schema       string            `json:"schema"`
+	Protocol     string            `json:"protocol"`
+	Handler      Handler           `json:"handler"`
+	Input        Schema            `json:"input"`
+	Output       Schema            `json:"output"`
+	Recovery     string            `json:"recovery"`
+	Cancellation string            `json:"cancellation"`
+	Runnable     map[string]string `json:"runnable"`
 
 	MaxInputBytes  uint64 `json:"max-input-bytes"`
 	MaxOutputBytes uint64 `json:"max-output-bytes"`
@@ -76,6 +77,7 @@ func Generate(runnable *resources.Runnable, handlerModule string) *Generated {
 		Input:          schemaOf(runnable.Contract.Input),
 		Output:         schemaOf(runnable.Contract.Output),
 		Recovery:       string(runnable.Execution.Recovery),
+		Cancellation:   string(runnable.Execution.Cancellation),
 		MaxInputBytes:  runnable.Execution.MaxInputBytes(),
 		MaxOutputBytes: runnable.Execution.MaxOutputBytes(),
 		MaxLogBytes:    runnable.Execution.MaxLogBytes(),

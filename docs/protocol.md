@@ -39,7 +39,7 @@ This input decodes to `{"text":"one two three"}`. An invocation must match the
 release embedded by the Builder. Standalone generation, which has no owning
 workspace, checks the declaration's name and version. `invocation_id` and
 `intent_id` are required and at most 128 characters. `effect_id` is required for
-`receipt` recovery and absent for `recompute`.
+`receipt` recovery and optional for `recompute`.
 
 ## Results and certainty
 
@@ -60,11 +60,13 @@ raise HandlerFailure("unavailable", "The operation was refused")
 
 This writes `status: FAILED` with `error: {code, message}` and no output. Use it
 only when the operation knows its effect's disposition. An unexpected exception,
-invalid payload, invalid return, import failure, timeout or interruption writes
-no result. Core therefore cannot mistake an unknown external effect for a known
-failure.
+invalid payload, invalid return, import failure or timeout writes no result.
+When the generated contract declares signal cancellation, a handled interruption
+writes `status: INTERRUPTED` without output. Core classifies it as `CANCELED`,
+which leaves the effect uncertain; it is never a certain operation failure.
+A contract declaring no cancellation does not install interruption handlers.
 
-Because those outcomes write nothing, the harness removes any document at the
+To prevent an earlier result from surviving an outcome that writes nothing, the harness removes any document at the
 result path before it reads the request, and refuses to start if it cannot. A
 document at that path is always this invocation's, so a launcher reusing the
 path cannot read an earlier attempt's result as this one's. The result is

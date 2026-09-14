@@ -110,8 +110,8 @@ class Request:
         identity = InvocationIdentity(_identifier(document, "invocation_id"),
                                       _identifier(document, "intent_id"),
                                       _identifier(document, "effect_id", False))
-        if (recovery == "receipt") != bool(identity.effect):
-            raise ProtocolError("effect_id is required exactly for receipt recovery")
+        if recovery == "receipt" and not identity.effect:
+            raise ProtocolError("effect_id is required for receipt recovery")
         release = document.get("runnable")
         keys = {"name", "module", "workspace", "version"}
         if not isinstance(release, dict) or release.keys() != keys:
@@ -151,9 +151,11 @@ def _instant(raw: Any, field: str) -> datetime:
 
 
 def completion_document(*, identity: InvocationIdentity, output: dict | None = None,
-                        failure: HandlerFailure | None = None) -> dict:
+                        failure: HandlerFailure | None = None, interrupted: bool = False) -> dict:
     document = {"protocol": PROTOCOL, "invocation_id": identity.invocation}
-    if failure is not None:
+    if interrupted:
+        document.update(status="INTERRUPTED")
+    elif failure is not None:
         document.update(status="FAILED", error={"code": failure.code, "message": str(failure)})
     else:
         payload = json.dumps(output, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
