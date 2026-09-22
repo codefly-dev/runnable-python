@@ -2,6 +2,9 @@ publisher: codefly.dev
 kind: codefly:runnable
 name: python
 version: 0.0.2
+release:
+  owner: workflow
+  workflow: releaser.yml
 conformance:
   mode: runnable-package
   handler: handler.py
