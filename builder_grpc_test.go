@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codefly-dev/core/agents/contract"
 	"github.com/codefly-dev/core/agents/manager"
 	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
 	agentv0 "github.com/codefly-dev/core/generated/go/codefly/services/agent/v0"
@@ -42,6 +43,7 @@ func TestBuilderPackagesThePreparedSnapshotOverGRPC(t *testing.T) {
 	client := builderv0.NewBuilderClient(connection.GRPCConn())
 	info, err := agentv0.NewAgentClient(connection.GRPCConn()).GetAgentInformation(ctx, &agentv0.AgentInformationRequest{})
 	require.NoError(t, err)
+	require.NoError(t, contract.Check(info.GetContract()), "the live agent must advertise the protocol implemented by its server")
 	require.Equal(t, []*agentv0.Capability{{Type: agentv0.Capability_BUILDER}}, info.GetCapabilities())
 
 	workspaceDir := filepath.Join(root, "workspace")
