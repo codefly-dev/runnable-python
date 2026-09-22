@@ -2,3 +2,6 @@ publisher: codefly.dev
 kind: codefly:runnable
 name: python
 version: 0.0.2
+conformance:
+  mode: runnable-package
+  handler: handler.py
