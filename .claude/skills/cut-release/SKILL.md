@@ -5,39 +5,28 @@ description: Publish a runnable-python version — bump the agent manifest and e
 
 # Cutting a runnable-python release
 
-A release is a tag. `.github/workflows/releaser.yml` fires on `v*`, re-runs both
-suites, then runs GoReleaser; nothing is built by hand, and the tag is the only
-trigger.
+Use `codefly publish` with Runnable release support. It qualifies the bumped
+candidate, lands the release PR, and tags the merged commit. Never hand-tag or
+replace published assets. `.github/workflows/releaser.yml` also reruns both
+suites and builds the four GoReleaser platforms on a new semantic tag.
 
-## The version lives in more than one file
-
-`agent.codefly.yaml` is the source — `main.go` embeds it, and the agent
-advertises that identity. But a declaration names the agent it wants, so every
-test declaration pins the same version. Bump them together:
-
-| File | Form |
-| --- | --- |
-| `agent.codefly.yaml` | `version: X.Y.Z` |
-| `qualification_test.go` | `agent:` block of the declaration |
-| `pkg/pack/pack_test.go` | same |
-| `pkg/generate/generate_test.go` | same |
-| `builder_grpc_test.go` | `codefly.dev/python:X.Y.Z` passed to `ParseAgent` |
-| `README.md` | the status line naming the agent version |
-
-Bumping the manifest alone is not a silent drift: `Load` rejects it with
-`declaration pins a different Runnable agent`, and the gRPC builder test fails.
-That is the check — run `go test ./...` after the bump, before tagging.
+`agent.codefly.yaml` is the release identity embedded by `main.go`. The real
+gRPC test reads that manifest when selecting its newly built candidate, so a
+release bump cannot leave the test requesting an older executable. The pure
+generation and packaging fixtures use independent example release identities;
+they do not have to change when this agent releases.
 
 ## Steps
 
-1. Bump every file above, in one commit, on a branch. `go test ./...` and
-   `cd pkg/harness && uv run --with pytest --python 3.12 pytest -q` both pass.
-2. Merge the PR.
-3. Tag the merged commit `vX.Y.Z` — the same `X.Y.Z` as the manifest — and push
-   the tag. GoReleaser derives the asset version from the tag, so a tag that
-   disagrees with the manifest publishes assets the CLI will not find.
-4. Watch the `GoReleaser` workflow. Its `test` job gates `release`; a red suite
-   means no assets, not a partial release.
+1. Run `go test ./...` and, from `pkg/harness`,
+   `uv run --with pytest --python 3.12 pytest -q`. Merge the reviewed source PR
+   only after all checks pass.
+2. In a clean checkout of green main, run `codefly publish --dry-run`, then
+   `codefly publish`. Its `runnable-package` conformance must create and package
+   through the built agent; never waive it with `--skip-conformance`.
+3. Watch `GoReleaser` and verify every archive against its checksums. Qualify
+   the downloaded native binary through the real consumer lifecycle before
+   updating a consumer selection.
 
 ## What the asset names have to be
 

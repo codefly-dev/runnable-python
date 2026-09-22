@@ -107,10 +107,10 @@ do not run commands out of them or trust their digests.
   two callers apart, and `Load` replaces what it finds, so one connection drives
   one Runnable at a time. Concurrent builds get one agent process each — do not
   add a session map to paper over this.
-- **The agent version is pinned in more than one place.** `agent.codefly.yaml`
-  is the source, and every test declaration pins the same agent; bumping one
-  alone fails `Load` with `declaration pins a different Runnable agent`. See the
-  release skill before touching it.
+- **The manifest is the release identity.** The real gRPC test reads it before
+  building and loading the candidate. Pure generation/package fixtures use
+  independent example versions; they do not select the built executable. See
+  the release skill before publishing.
 
 ## Procedures
 
