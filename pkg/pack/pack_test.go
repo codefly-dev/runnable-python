@@ -99,6 +99,12 @@ func TestTheConfigurationDigestFollowsWhatAnInvocationIsBoundTo(t *testing.T) {
 	if relaxed := digestFor(t, strings.Replace(declaration, "timeout: 30s", "timeout: 5m", 1)); relaxed == base {
 		t.Error("a different execution bound did not move the configuration digest")
 	}
+	// Two packages differing only in how their answer arrives are called the
+	// same way and answered differently, so the mode has to reach the digest.
+	if submitted := digestFor(t, strings.Replace(declaration,
+		"recovery: receipt", "recovery: receipt\n  completion: submit", 1)); submitted == base {
+		t.Error("declaring another completion mode did not move the configuration digest")
+	}
 }
 
 func TestTheSamePreparedTreeAlwaysPackagesToTheSameDigest(t *testing.T) {
