@@ -26,7 +26,7 @@ agent:
   version: 0.0.2
   publisher: codefly.dev
 contract:
-  protocol: codefly.runnable/v1
+  protocol: codefly.runnable.served/v1
   input:
     fields:
       - name: amount
@@ -39,7 +39,7 @@ entrypoint:
   handler: handler.py
   inputs: [uv.lock, pyproject.toml]
 execution:
-  facilities: [native]
+  facilities: [generated-service]
   timeout: 30s
   cancellation: signal
   recovery: receipt

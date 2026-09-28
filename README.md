@@ -2,7 +2,7 @@
 
 The Codefly language agent for typed, finite Python operations: generate a handler, prepare its dependencies, and produce identified native packages and container build recipes.
 
-**Status: native authoring and packaging are implemented through the real Builder gRPC lifecycle on core v0.3.29.** Agent 0.0.2 includes the shared invocation/result framing and signal-cancellation contract; published binaries appear on the [releases page](https://github.com/codefly-dev/runnable-python/releases). [Milestone 3](docs/milestone_3_builder_grpc.md) records the Builder checkpoint; [issue #1](https://github.com/codefly-dev/runnable-python/issues/1) still tracks durable native and Kubernetes execution.
+**Status: the generated harness serves call mode on core v0.6.0, and authoring, preparation and packaging run through the real Builder gRPC lifecycle.** A package is a server: one call is a POST carrying the bounded input document, with the caller's Work Context required on it ([docs/protocol.md](docs/protocol.md)). The launcher framing — two document paths in the environment, a result file, an exit code a launcher read — went with the native placement in core#681. Published binaries appear on the [releases page](https://github.com/codefly-dev/runnable-python/releases). [Milestone 3](docs/milestone_3_builder_grpc.md) records the Builder checkpoint and predates the served harness; [issue #1](https://github.com/codefly-dev/runnable-python/issues/1) still tracks durable Kubernetes execution.
 
 The review corrections and current validation are recorded in [milestone 2](docs/milestone_2_review_fixes.md). Earlier image/k3d observations are historical and do not qualify the Codefly/Orchestration path.
 
@@ -12,8 +12,8 @@ Python handler templates, generated input/output types, the invocation harness, 
 
 | Package | What it owns |
 |---|---|
-| `pkg/contract` | the `codefly.runnable/v1` framing, in Go ([docs/protocol.md](docs/protocol.md)) |
-| `pkg/harness` | the Python harness generated into every runnable: the same framing, and the bounded schema profile it enforces |
+| `pkg/contract` | the `codefly.runnable.served/v1` framing, in Go ([docs/protocol.md](docs/protocol.md)) |
+| `pkg/harness` | the Python harness generated into every runnable: it serves the operation, and enforces the bounded schema profile on both payloads |
 | `pkg/generate` | the handler scaffold, the typed bindings of a contract, the generated contract |
 | `pkg/prepare` | uv-locked dependencies and the pinned interpreter |
 | `pkg/pack` | the native package and the build evidence that identifies it |

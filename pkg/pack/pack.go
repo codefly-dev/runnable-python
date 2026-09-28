@@ -68,7 +68,7 @@ func Native(
 		return nil, err
 	}
 	artifact := &basev0.RunnableArtifact{
-		Kind:      basev0.RunnableArtifact_NATIVE,
+		Kind:      basev0.RunnableArtifact_ARCHIVE,
 		Platform:  runtime.GOOS + "/" + runtime.GOARCH,
 		Reference: filepath.Base(archive),
 		Digest:    digest,

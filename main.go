@@ -2,7 +2,7 @@
 //
 // The implementation lives under ./pkg:
 //
-//	github.com/codefly-dev/runnable-python/pkg/contract  — codefly.runnable/v1 framing
+//	github.com/codefly-dev/runnable-python/pkg/contract  — codefly.runnable.served/v1 framing
 //	github.com/codefly-dev/runnable-python/pkg/harness   — the Python harness it generates
 //	github.com/codefly-dev/runnable-python/pkg/generate  — handler, typed bindings, contract
 //	github.com/codefly-dev/runnable-python/pkg/prepare   — locked dependencies and interpreter
