@@ -2,12 +2,15 @@ package main_test
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,11 +25,17 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/codefly-dev/runnable-python/pkg/contract"
 	"github.com/codefly-dev/runnable-python/pkg/generate"
 	"github.com/codefly-dev/runnable-python/pkg/pack"
 	"github.com/codefly-dev/runnable-python/pkg/prepare"
 	"github.com/codefly-dev/runnable-python/pkg/recipe"
+)
+
+// The per-call facts a caller presents. The Work Context is carried verbatim
+// and never parsed, here or in the harness.
+const (
+	invocationID = "inv-1"
+	workContext  = "eyJ0eXAiOiJjb2RlZmx5LndvcmstY29udGV4dC92MSJ9.signed"
 )
 
 const declaration = `kind: runnable
@@ -39,7 +48,7 @@ agent:
   version: 0.0.2
   publisher: codefly.dev
 contract:
-  protocol: codefly.runnable/v1
+  protocol: codefly.runnable.served/v1
   input:
     fields:
       - name: text
@@ -61,7 +70,7 @@ entrypoint:
   handler: handler.py
   inputs: [pyproject.toml, uv.lock]
 execution:
-  facilities: [native, kubernetes]
+  facilities: [generated-service, kubernetes]
   timeout: 2m
   cancellation: signal
   recovery: recompute
@@ -134,7 +143,7 @@ func TestANativePackageCompletesAnInvocation(t *testing.T) {
 
 	artifact := artifacts(t, evidence)[0]
 	pkg := packageFromEvidence(t, runnable, evidence)
-	if artifact["kind"] != "NATIVE" {
+	if artifact["kind"] != "ARCHIVE" {
 		t.Fatalf("artifact kind is %v", artifact["kind"])
 	}
 	installed := filepath.Join(workspace, "installed", "word-count")
@@ -163,27 +172,32 @@ func TestANativePackageCompletesAnInvocation(t *testing.T) {
 		t.Fatalf("build evidence describes a different handler: got %s, archive %s", build.Handler.Digest, want)
 	}
 
-	empty := invoke(t, installed, command(t, artifact), pkg, map[string]any{"text": "one two three"})
-	if empty.outcome() != "SUCCEEDED" {
-		t.Fatalf("outcome %q: %v %s", empty.outcome(), empty.completion["error"], empty.stderr)
+	harness := serve(t, installed, command(t, artifact), pkg)
+
+	empty := harness.call(t, corerunnable.ServedInvokeProcedure, map[string]any{"text": "one two three"})
+	if got := count(t, empty); got != 3 {
+		t.Fatalf("count = %d, want 3\n%s", got, harness.stderr.String())
 	}
-	if got := empty.count(t); got != 3 {
-		t.Fatalf("count = %d, want 3", got)
+	if !corerunnable.ServedOutcomeIsCertain(empty.GetOutcome()) {
+		t.Fatal("a validated answer must prove the effect committed")
 	}
 
-	filtered := invoke(t, installed, command(t, artifact), pkg, map[string]any{
+	// The package serves: it does not exit after one call. Every call below is
+	// answered by the same process, which is the whole difference from the
+	// placement this replaced.
+	filtered := harness.call(t, corerunnable.ServedInvokeProcedure, map[string]any{
 		"text":    "one two three",
 		"options": map[string]any{"stop_words": []string{"two"}},
 	})
-	if got := filtered.count(t); got != 2 {
+	if got := count(t, filtered); got != 2 {
 		t.Fatalf("filtered count = %d, want 2", got)
 	}
 
-	nulled := invoke(t, installed, command(t, artifact), pkg, map[string]any{
+	nulled := harness.call(t, corerunnable.ServedInvokeProcedure, map[string]any{
 		"text":    "one two three four",
 		"options": map[string]any{"stop_words": nil},
 	})
-	if got := nulled.count(t); got != 4 {
+	if got := count(t, nulled); got != 4 {
 		t.Fatalf("nullable count = %d, want 4", got)
 	}
 }
@@ -212,16 +226,84 @@ func TestAnInstalledPackageRefusesAnInvalidPayload(t *testing.T) {
 
 	evidence, err := pack.Native(runnable, runnable.Agent, prepared, filepath.Join(workspace, "artifact.tar.gz"))
 	require.NoError(t, err)
-	result := invoke(t, prepared.Root, prepared.Command, packageFromEvidence(t, runnable, evidence), map[string]any{"text": 3})
-	if result.exit != contract.ExitInvalidInput {
-		t.Fatalf("exit = %d, want %d (%s)", result.exit, contract.ExitInvalidInput, result.stderr)
+	harness := serve(t, prepared.Root, prepared.Command, packageFromEvidence(t, runnable, evidence))
+
+	completion := harness.call(t, corerunnable.ServedInvokeProcedure, map[string]any{"text": 3})
+
+	if completion.GetOutcome() == basev0.RunnableServedOutcome_SERVED_SUCCEEDED {
+		t.Fatalf("a payload the contract refuses was accepted: %s", completion.GetResult().GetOutput())
 	}
-	if result.outcome() != "CRASHED" {
-		t.Fatalf("outcome = %q", result.outcome())
+	// A refused payload never reached the handler, so nothing committed — but
+	// "proven not committed" is the operation asserting it in its own
+	// vocabulary, and a refused request is not the operation speaking.
+	if completion.GetFailureCode() != "" {
+		t.Fatalf("a refused payload is not the operation's own failure: %q", completion.GetFailureCode())
 	}
-	if _, recorded := result.completion["output"]; recorded {
-		t.Fatal("a refused invocation recorded an output")
+	if corerunnable.ServedOutcomeIsCertain(completion.GetOutcome()) {
+		t.Fatalf("a refused payload leaves the outcome unproven, got %s", completion.GetOutcome())
 	}
+
+	// The harness answers again afterwards: a refusal ends a call, not the
+	// process that serves them.
+	second := harness.call(t, corerunnable.ServedInvokeProcedure, map[string]any{"text": "one two"})
+	if second.GetOutcome() != basev0.RunnableServedOutcome_SERVED_SUCCEEDED {
+		t.Fatalf("the call after a refused one: %s %q\n--- stderr ---\n%s", second.GetOutcome(), second.GetMessage(), harness.stderr.String())
+	}
+}
+
+// TestAnInstalledPackageRefusesACallWithNoIdentity proves the identity slot in
+// the package a placement actually runs, not only in the harness suite. A call
+// with no Work Context is refused rather than run under whatever identity the
+// process happens to have, which is the state the required slot removes — and
+// the handler's own declared failure is the one answer that proves no effect
+// committed.
+func TestAnInstalledPackageRefusesACallWithNoIdentity(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	source := filepath.Join(workspace, "runnables", "word-count")
+
+	runnable := declare(t, ctx, source)
+	require.NoError(t, generate.Scaffold(runnable, source))
+	require.NoError(t, generate.Generate(runnable, source))
+	write(t, filepath.Join(source, "handler.py"), `from codefly_runnable import Context, HandlerFailure
+
+
+def handle(context: Context, input) -> dict:
+    if input["text"] == "declined":
+        raise HandlerFailure("card_declined", "the issuer declined")
+    if input["text"] == "untyped":
+        raise RuntimeError("something went wrong")
+    return {"count": len(context.invocation.work_context.split())}
+`)
+
+	prepared, err := prepare.Prepare(ctx, runnable, source, filepath.Join(workspace, "build", "native"))
+	require.NoError(t, err)
+	evidence, err := pack.Native(runnable, runnable.Agent, prepared, filepath.Join(workspace, "artifact.tar.gz"))
+	require.NoError(t, err)
+	harness := serve(t, prepared.Root, prepared.Command, packageFromEvidence(t, runnable, evidence))
+
+	// The handler sees the caller's capability verbatim: forwarding it is the
+	// only thing a handler may do with one, and the harness neither parses nor
+	// reconstructs it.
+	carried := harness.call(t, corerunnable.ServedInvokeProcedure, map[string]any{"text": "a"})
+	require.Equal(t, len(strings.Fields(workContext)), count(t, carried))
+
+	none := harness.call(t, corerunnable.ServedInvokeProcedure, map[string]any{"text": "a"},
+		map[string]string{corerunnable.WorkContextHeader: ""})
+	require.NotEqual(t, basev0.RunnableServedOutcome_SERVED_SUCCEEDED, none.GetOutcome())
+	require.False(t, corerunnable.ServedOutcomeIsCertain(none.GetOutcome()),
+		"a refused call is not the operation asserting anything")
+	require.Contains(t, harness.stderr.String(), "Work Context")
+
+	declined := harness.call(t, corerunnable.ServedInvokeProcedure, map[string]any{"text": "declined"})
+	require.Equal(t, basev0.RunnableServedOutcome_SERVED_OWNER_FAILED, declined.GetOutcome())
+	require.Equal(t, "card_declined", declined.GetFailureCode())
+	require.True(t, corerunnable.ServedOutcomeIsCertain(declined.GetOutcome()),
+		"the operation's own typed code proves no effect committed")
+
+	untyped := harness.call(t, corerunnable.ServedInvokeProcedure, map[string]any{"text": "untyped"})
+	require.Empty(t, untyped.GetFailureCode(), "an untyped error asserts nothing on the handler's behalf")
+	require.False(t, corerunnable.ServedOutcomeIsCertain(untyped.GetOutcome()))
 }
 
 // TestTheImageRecipeDescribesALinuxBuild checks the recipe the CLI's image
@@ -285,80 +367,152 @@ func declare(t *testing.T, ctx context.Context, dir string) *resources.Runnable 
 	return runnable
 }
 
-type invocation struct {
-	exit       int
-	stdout     string
-	stderr     string
-	completion map[string]any
-	classified *basev0.RunnableCompletion
+// served is a generated package running the way a placement runs it: the
+// allocated address in the environment, and nothing else.
+type served struct {
+	address string
+	process *exec.Cmd
+	stderr  *strings.Builder
+	pkg     *basev0.RunnablePackage
 }
 
-func (i invocation) outcome() string {
-	return i.classified.GetOutcome().String()
-}
-
-func (i invocation) count(t *testing.T) int {
+// serve starts the installed package and waits until it answers. The port is
+// chosen by the operating system and handed over the way a placement hands one
+// over: nothing here picks a number.
+func serve(t *testing.T, root string, argv []string, pkg *basev0.RunnablePackage) served {
 	t.Helper()
-	output, ok := i.completion["output"].(map[string]any)
-	if !ok {
-		t.Fatalf("completion carries no output: %v", i.completion)
-	}
-	count, ok := output["count"].(float64)
-	if !ok {
-		t.Fatalf("output.count is %v", output["count"])
-	}
-	return int(count)
-}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	address := listener.Addr().String()
+	require.NoError(t, listener.Close())
 
-// invoke runs one invocation the way a launcher does: a request document in, a
-// completion document out, logs on the process streams.
-func invoke(t *testing.T, root string, argv []string, pkg *basev0.RunnablePackage, payload map[string]any) invocation {
-	t.Helper()
-	requestPath := filepath.Join(t.TempDir(), "request.json")
-	resultPath := filepath.Join(t.TempDir(), "result.json")
-	input, err := json.Marshal(payload)
-	require.NoError(t, err)
-	started := time.Now()
-	inv, err := corerunnable.PrepareInvocation(&basev0.RunnableInvocation{
-		Protocol: corerunnable.ProtocolV1, Runnable: pkg.GetIdentity(), InvocationId: "inv-1", IntentId: "intent-1",
-		IssuedAt: timestamppb.New(started), Deadline: timestamppb.New(started.Add(time.Minute)), Input: input,
-	}, pkg)
-	require.NoError(t, err)
-	document, err := corerunnable.EncodeInvocation(inv)
-	require.NoError(t, err)
-	write(t, requestPath, string(document))
-	ctx, cancel := context.WithDeadline(t.Context(), inv.GetDeadline().AsTime())
-	defer cancel()
-	process := exec.CommandContext(ctx, filepath.Join(root, argv[0]), argv[1:]...)
+	stderr := &strings.Builder{}
+	process := exec.Command(filepath.Join(root, argv[0]), argv[1:]...)
 	process.Dir = root
-	process.Env = os.Environ()
-	for key, value := range corerunnable.InvocationEnvironment(inv, requestPath, resultPath) {
-		process.Env = append(process.Env, key+"="+value)
+	process.Env = append(os.Environ(), corerunnable.ListenAddressEnv+"="+address)
+	process.Stderr = stderr
+	require.NoError(t, process.Start())
+	t.Cleanup(func() {
+		_ = process.Process.Signal(os.Interrupt)
+		done := make(chan struct{})
+		go func() { _, _ = process.Process.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(45 * time.Second):
+			_ = process.Process.Kill()
+		}
+	})
+
+	for range 600 {
+		if process.ProcessState != nil {
+			break
+		}
+		connection, err := net.DialTimeout("tcp", address, 50*time.Millisecond)
+		if err == nil {
+			require.NoError(t, connection.Close())
+			return served{address: address, process: process, stderr: stderr, pkg: pkg}
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
-	var stdout, stderr strings.Builder
-	process.Stdout, process.Stderr = &stdout, &stderr
-	runErr := process.Run()
-	require.NotNil(t, process.ProcessState, "start process: %v", runErr)
-	result := invocation{exit: process.ProcessState.ExitCode(), stdout: stdout.String(), stderr: stderr.String()}
-	recorded, err := os.ReadFile(resultPath)
-	present := err == nil
-	if err != nil {
-		require.True(t, os.IsNotExist(err), "%v", err)
-	}
-	observed := corerunnable.Observation{ResultPresent: present, Result: recorded, ExitCode: int32(result.exit), StartedAt: started, EndedAt: time.Now()}
-	result.classified, err = corerunnable.Complete(inv, pkg, observed)
+	t.Fatalf("the package never answered on %s\n--- stderr ---\n%s", address, stderr.String())
+	return served{}
+}
+
+// call sends one call the way the durable-work runtime's invoker sends one —
+// core's header spellings, core's procedure, the bounded input document as the
+// whole body — and classifies the answer with core's own ClassifyServed. Every
+// constant is read from core, so a harness that drifted from the contract fails
+// here rather than in a live composition.
+func (s served) call(t *testing.T, procedure string, payload map[string]any, headers ...map[string]string) *basev0.RunnableServedCompletion {
+	t.Helper()
+	body, err := json.Marshal(payload)
 	require.NoError(t, err)
-	if present {
-		parsed, err := corerunnable.ParseResult(recorded, inv, pkg)
-		require.NoError(t, err, string(recorded))
-		result.completion = map[string]any{}
-		if parsed.GetStatus() == basev0.RunnableResult_SUCCEEDED {
-			var output map[string]any
-			require.NoError(t, json.Unmarshal(parsed.GetOutput(), &output))
-			result.completion["output"] = output
+	inv := s.invocation(t, body)
+
+	request, err := http.NewRequest(http.MethodPost, "http://"+s.address+procedure, bytes.NewReader(body))
+	require.NoError(t, err)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(corerunnable.WorkContextHeader, workContext)
+	request.Header.Set(corerunnable.EffectHeader, inv.GetEffectId())
+	request.Header.Set(corerunnable.DeadlineHeader, inv.GetDeadline().AsTime().Format(corerunnable.DeadlineFormat))
+	for _, overrides := range headers {
+		for name, value := range overrides {
+			if value == "" {
+				request.Header.Del(name)
+				continue
+			}
+			request.Header.Set(name, value)
 		}
 	}
-	return result
+
+	observed := corerunnable.Call{CalledAt: time.Now().UTC(), AuthorityResolved: true}
+	response, err := (&http.Client{Timeout: 2 * time.Minute}).Do(request)
+	observed.AnsweredAt = time.Now().UTC()
+	if err != nil {
+		observed.Trouble = err
+	} else {
+		defer func() { require.NoError(t, response.Body.Close()) }()
+		observed.Answered = true
+		observed.FailureCode = response.Header.Get(corerunnable.FailureCodeHeader)
+		answered, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+		require.NoError(t, err)
+		observed.Response = s.resultOf(t, response.StatusCode, answered)
+		if response.StatusCode != http.StatusOK && observed.FailureCode == "" {
+			observed.Trouble = fmt.Errorf("owner answered %d: %s", response.StatusCode, answered)
+		}
+	}
+	completion, err := corerunnable.ClassifyServed(inv, s.pkg, observed)
+	require.NoError(t, err)
+	return completion
+}
+
+// resultOf turns the owner's answer into the RunnableResult core classifies. A
+// 200 is the bounded output document; anything else answered no output at all,
+// and a result invented for it would be a completion the owner never gave.
+func (s served) resultOf(t *testing.T, status int, body []byte) []byte {
+	t.Helper()
+	if status != http.StatusOK {
+		return nil
+	}
+	document, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(&basev0.RunnableResult{
+		Protocol:     corerunnable.ServedProtocolV1,
+		InvocationId: invocationID,
+		Status:       basev0.RunnableResult_SUCCEEDED,
+		Output:       body,
+	})
+	require.NoError(t, err)
+	return document
+}
+
+func (s served) invocation(t *testing.T, input []byte) *basev0.RunnableInvocation {
+	t.Helper()
+	issued := time.Now().UTC()
+	inv, err := corerunnable.PrepareInvocation(&basev0.RunnableInvocation{
+		Protocol:     corerunnable.ServedProtocolV1,
+		Runnable:     s.pkg.GetIdentity(),
+		InvocationId: invocationID,
+		IntentId:     "intent-1",
+		EffectId:     "effect-1",
+		IssuedAt:     timestamppb.New(issued),
+		Deadline:     timestamppb.New(issued.Add(time.Minute)),
+		Input:        input,
+		Identity: &basev0.RunnableInvocationIdentity{
+			Carrier: &basev0.RunnableInvocationIdentity_WorkContext{WorkContext: workContext},
+		},
+	}, s.pkg)
+	require.NoError(t, err)
+	return inv
+}
+
+// count reads the operation's own output out of a classified success.
+func count(t *testing.T, completion *basev0.RunnableServedCompletion) int {
+	t.Helper()
+	require.Equal(t, basev0.RunnableServedOutcome_SERVED_SUCCEEDED, completion.GetOutcome(), completion.GetMessage())
+	var output struct {
+		Count int `json:"count"`
+	}
+	require.NoError(t, json.Unmarshal(completion.GetResult().GetOutput(), &output))
+	return output.Count
 }
 
 func packageFromEvidence(t *testing.T, r *resources.Runnable, evidence *pack.Evidence) *basev0.RunnablePackage {

@@ -10,39 +10,36 @@ import (
 )
 
 // Protocol is the only invocation protocol this agent generates for.
-const Protocol = resources.RunnableProtocolV1
+const Protocol = resources.RunnableServedProtocolV1
 
 // GeneratedSchema identifies agent-private generated configuration, not wire framing.
 const GeneratedSchema = "codefly.runnable-generated-contract/v1"
 
-// Exit codes are diagnostics only. Core classifies the observed process and result.
-const (
-	ExitCompleted     = 0
-	ExitInvalidInput  = 64
-	ExitInvalidOutput = 65
-	ExitFailed        = 66
-	ExitTimeout       = 67
-	ExitInterrupted   = 68
-	ExitProtocol      = 69
-)
-
 // HandlerAttribute is the function every generated handler exposes.
 const HandlerAttribute = "handle"
 
+// ReceiptAttribute is the function a receipt-recovery handler exposes beside
+// it. The harness refuses to serve without one: an owner that cannot answer
+// what an effect committed leaves every uncertain outcome uncertain forever.
+const ReceiptAttribute = "receipt_of"
+
 // Generated is the contract document the agent writes beside the harness.
 type Generated struct {
-	Schema       string            `json:"schema"`
-	Protocol     string            `json:"protocol"`
-	Handler      Handler           `json:"handler"`
-	Input        Schema            `json:"input"`
-	Output       Schema            `json:"output"`
-	Recovery     string            `json:"recovery"`
-	Cancellation string            `json:"cancellation"`
-	Runnable     map[string]string `json:"runnable"`
+	Schema   string            `json:"schema"`
+	Protocol string            `json:"protocol"`
+	Handler  Handler           `json:"handler"`
+	Input    Schema            `json:"input"`
+	Output   Schema            `json:"output"`
+	Recovery string            `json:"recovery"`
+	Runnable map[string]string `json:"runnable"`
 
 	MaxInputBytes  uint64 `json:"max-input-bytes"`
 	MaxOutputBytes uint64 `json:"max-output-bytes"`
-	MaxLogBytes    uint64 `json:"max-log-bytes"`
+	// TimeoutNanoseconds is the declared timeout, which bounds one call. It is
+	// in the document because the harness has to know it without the caller:
+	// a call carrying no deadline header is bounded by the author's own
+	// statement of how long the operation may run.
+	TimeoutNanoseconds int64 `json:"timeout-nanoseconds"`
 }
 
 // Handler locates the author entrypoint inside the generated package.
@@ -71,17 +68,33 @@ type Field struct {
 // Runnable.Validate has already confined to the runnable directory.
 func Generate(runnable *resources.Runnable, handlerModule string) *Generated {
 	return &Generated{
-		Schema:         GeneratedSchema,
-		Protocol:       Protocol,
-		Handler:        Handler{Module: handlerModule, Attribute: HandlerAttribute},
-		Input:          schemaOf(runnable.Contract.Input),
-		Output:         schemaOf(runnable.Contract.Output),
-		Recovery:       string(runnable.Execution.Recovery),
-		Cancellation:   string(runnable.Execution.Cancellation),
-		MaxInputBytes:  runnable.Execution.MaxInputBytes(),
-		MaxOutputBytes: runnable.Execution.MaxOutputBytes(),
-		MaxLogBytes:    runnable.Execution.MaxLogBytes(),
-		Runnable:       map[string]string{"name": runnable.Name, "version": runnable.Version},
+		Schema:             GeneratedSchema,
+		Protocol:           Protocol,
+		Handler:            Handler{Module: handlerModule, Attribute: HandlerAttribute},
+		Input:              schemaOf(runnable.Contract.Input),
+		Output:             schemaOf(runnable.Contract.Output),
+		Recovery:           string(runnable.Execution.Recovery),
+		MaxInputBytes:      runnable.Execution.MaxInputBytes(),
+		MaxOutputBytes:     runnable.Execution.MaxOutputBytes(),
+		TimeoutNanoseconds: runnable.Execution.GetTimeout().Nanoseconds(),
+		// The whole release identity, not the half a declaration states: the
+		// harness hands it to the handler, and a field missing from the
+		// document is a field the handler cannot read. Standalone generation
+		// has no resolved workspace, which is a blank field rather than an
+		// absent one.
+		Runnable: releaseOf(runnable),
+	}
+}
+
+// releaseOf is the release identity as the declaration knows it. The Builder
+// replaces it with the workspace-resolved one during Load.
+func releaseOf(runnable *resources.Runnable) map[string]string {
+	identity := runnable.Identity()
+	return map[string]string{
+		"name":      identity.Name,
+		"module":    identity.Module,
+		"workspace": identity.Workspace,
+		"version":   runnable.Version,
 	}
 }
 

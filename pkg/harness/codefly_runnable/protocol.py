@@ -1,43 +1,58 @@
-"""codefly.runnable/v1 proto3 JSON, defined by codefly-dev/core."""
+"""codefly.runnable.served/v1: what one call carries, defined by codefly-dev/core.
+
+A runnable is called, not launched. The bounded input document is the whole
+request body — a field Codefly added to it would be a field the operation never
+described — and the per-call facts that are not the body travel as headers whose
+spellings core pins. They are restated here because the harness runs inside a
+package that carries no Go dependency: a harness reading one spelling while its
+caller writes another is an unreachable owner, which reads as an outage rather
+than as a mistake in a string.
+"""
 from __future__ import annotations
 
-import base64
-import binascii
 import json
-import os
-import re
-import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-PROTOCOL = "codefly.runnable/v1"
-PROTOCOL_VARIABLE = "CODEFLY__RUNNABLE_PROTOCOL"
-REQUEST_PATH_VARIABLE = "CODEFLY__RUNNABLE_INVOCATION"
-COMPLETION_PATH_VARIABLE = "CODEFLY__RUNNABLE_RESULT"
-DEFAULT_MAX_LOG_BYTES = 4 * 1024 * 1024
-MAX_ENVELOPE_BYTES = 64 * 1024
-# The result is readable by the launcher that started this process.
-RESULT_MODE = 0o644
+PROTOCOL = "codefly.runnable.served/v1"
 
-# Internal diagnostics. These are not RunnableCompletion outcomes.
-COMPLETED = "completed"
-INVALID_INPUT = "invalid_input"
-INVALID_OUTPUT = "invalid_output"
-FAILED = "failed"
-TIMEOUT = "timeout"
-INTERRUPTED = "interrupted"
-EXIT_CODES = {COMPLETED: 0, INVALID_INPUT: 64, INVALID_OUTPUT: 65,
-              FAILED: 66, TIMEOUT: 67, INTERRUPTED: 68}
-EXIT_PROTOCOL = 69
+# The address the placement allocated. It is the one fact the harness cannot
+# derive: a harness choosing its own port would be right on one machine for ten
+# minutes.
+ADDRESS_VARIABLE = "CODEFLY__RUNNABLE_ADDRESS"
+
+# The routes a generated harness answers on, and the headers one call's facts
+# arrive in. All six are core's constants (codefly-dev/core runnable/served.go).
+INVOKE_PROCEDURE = "/codefly.runnable.v0.Runnable/Invoke"
+LOOKUP_PROCEDURE = "/codefly.runnable.v0.Runnable/Lookup"
+WORK_CONTEXT_HEADER = "X-Codefly-Work-Context"
+EFFECT_HEADER = "Codefly-Runnable-Effect-Id"
+DEADLINE_HEADER = "Codefly-Runnable-Deadline"
+FAILURE_CODE_HEADER = "Codefly-Runnable-Failure-Code"
+
+# How much framing is read around the payload bound, so an oversized request is
+# refused without being read whole.
+MAX_ENVELOPE_BYTES = 64 * 1024
+
+# How long a call in flight has to finish after a signal. A handler interrupted
+# mid-effect leaves it unproven, so the process waits rather than making every
+# call in flight unproven at once.
+SHUTDOWN_GRACE_SECONDS = 30.0
 
 
 class ProtocolError(Exception):
-    """The invocation or environment does not satisfy the framing."""
+    """The call does not satisfy the framing, so the handler never ran."""
 
 
 class HandlerFailure(Exception):
-    """An operation's explicit, certain failure; never use for an unknown effect."""
+    """An operation's explicit, certain failure: the handler knows its effect did not happen.
+
+    Raising it is the ONLY thing that sets the failure-code header, and that
+    header is the only thing that proves to a caller that nothing committed.
+    Never raise it for an effect whose fate the handler does not know.
+    """
+
     def __init__(self, code: str, message: str) -> None:
         if not isinstance(code, str) or not 1 <= len(code) <= 128:
             raise ValueError("failure code must contain 1 to 128 characters")
@@ -48,14 +63,9 @@ class HandlerFailure(Exception):
 
 
 @dataclass(frozen=True)
-class InvocationIdentity:
-    invocation: str
-    intent: str
-    effect: str = ""
-
-
-@dataclass(frozen=True)
 class RunnableIdentity:
+    """The release this package implements."""
+
     name: str
     module: str
     workspace: str
@@ -65,16 +75,44 @@ class RunnableIdentity:
         return vars(self).copy()
 
 
-def _identifier(document: dict, key: str, required: bool = True) -> str:
-    value = document.get(key, "")
-    if not isinstance(value, str) or len(value) > 128 or (required and not value):
-        raise ProtocolError(f"request.{key} must contain {'1' if required else '0'} to 128 characters")
-    return value
+@dataclass(frozen=True)
+class InvocationIdentity:
+    """What the caller said about this call.
+
+    ``effect`` is the caller's idempotency key: an effect a handler records
+    under it is the one the caller looks up when an outcome is uncertain.
+
+    ``work_context`` is the caller's minted capability, carried verbatim. A
+    handler forwards it to whatever it calls in turn and never parses or
+    reconstructs it; the harness does neither too.
+    """
+
+    effect: str
+    work_context: str
 
 
-def _json(raw: bytes) -> Any:
+@dataclass(frozen=True)
+class Call:
+    """One validated call: the per-call facts, the payload and the budget."""
+
+    identity: InvocationIdentity
+    runnable: RunnableIdentity
+    deadline: datetime
+    budget: float
+    payload: dict[str, Any]
+
+
+def decode(raw: bytes) -> Any:
+    """Decode one JSON document, refusing a repeated key.
+
+    json keeps the last of a repeated key, which would let one document mean two
+    things to two readers. Numbers are kept as written, so the bounded profile's
+    integer stays distinct from a value carrying a fraction.
+    """
+
     def constant(value):
         raise ValueError(f"invalid JSON constant {value}")
+
     def unique(pairs):
         result = {}
         for key, value in pairs:
@@ -82,104 +120,87 @@ def _json(raw: bytes) -> Any:
                 raise ValueError(f"duplicate JSON key {key}")
             result[key] = value
         return result
+
+    return json.loads(raw.decode("utf-8"), parse_constant=constant, object_pairs_hook=unique)
+
+
+def read_call(headers, body: bytes, contract) -> Call:
+    """Read the per-call facts and the bounded body of one call.
+
+    Every refusal here happened before the handler ran, so nothing committed —
+    but a refused request is not the operation speaking, and only the operation's
+    own typed failure proves a no-effect failure. The caller reads these as
+    unproven and retries under its budget, which is harmless for a call that
+    never ran.
+    """
+    if len(body) > contract.max_input_bytes:
+        raise ProtocolError(
+            f"input is {len(body)} bytes, over the declared {contract.max_input_bytes} byte bound"
+        )
+
+    work_context = headers.get(WORK_CONTEXT_HEADER, "")
+    if not work_context:
+        # A call with no identity is the one thing the contract exists to
+        # prevent, so it is refused rather than run under whatever identity this
+        # process happens to have.
+        raise ProtocolError("the call carries no Work Context")
+    effect = headers.get(EFFECT_HEADER, "")
+    if contract.recovery == "receipt" and not effect:
+        raise ProtocolError("an effect identity is required for receipt recovery")
+
+    budget = contract.timeout_seconds
+    raw_deadline = headers.get(DEADLINE_HEADER, "")
+    if raw_deadline:
+        deadline = _instant(raw_deadline)
+        # Measured from now rather than from an instant the caller stamped, so
+        # an offset between the two clocks neither shortens nor extends the work
+        # the caller asked for beyond what it actually still allows.
+        budget = (deadline - datetime.now(timezone.utc)).total_seconds()
+        if budget <= 0:
+            raise ProtocolError("the deadline had passed before the call was read")
+        budget = min(budget, contract.timeout_seconds)
+
     try:
-        return json.loads(raw.decode("utf-8"), parse_constant=constant, object_pairs_hook=unique)
+        decoded = decode(body)
     except (UnicodeDecodeError, ValueError) as err:
-        raise ProtocolError(f"request is not UTF-8 JSON: {err}") from err
+        raise ProtocolError(f"request body is not UTF-8 JSON: {err}") from err
+    if not isinstance(decoded, dict):
+        raise ProtocolError("request body must be one JSON object")
+
+    return Call(
+        identity=InvocationIdentity(effect=effect, work_context=work_context),
+        runnable=contract.release,
+        deadline=datetime.now(timezone.utc) + timedelta(seconds=budget),
+        budget=budget,
+        payload=decoded,
+    )
 
 
-@dataclass(frozen=True)
-class Request:
-    identity: InvocationIdentity
-    runnable: RunnableIdentity
-    deadline: datetime
-    payload: dict[str, Any]
+def encode_output(output: Any, max_output_bytes: int) -> bytes:
+    """Render what the handler returned as the answer's body.
 
-    @staticmethod
-    def parse(raw: bytes, max_input_bytes: int, recovery: str, expected: dict) -> "Request":
-        if len(raw) > 4 * ((max_input_bytes + 2) // 3) + MAX_ENVELOPE_BYTES:
-            raise ProtocolError("request exceeds the payload plus envelope byte bound")
-        document = _json(raw)
-        if not isinstance(document, dict):
-            raise ProtocolError("request must be an object")
-        if document.get("protocol") != PROTOCOL:
-            raise ProtocolError(f"request protocol {document.get('protocol')!r} is not {PROTOCOL!r}")
-        allowed = {"protocol", "runnable", "invocation_id", "intent_id", "effect_id", "issued_at", "deadline", "input"}
-        if document.keys() - allowed:
-            raise ProtocolError("request contains unknown fields")
-        identity = InvocationIdentity(_identifier(document, "invocation_id"),
-                                      _identifier(document, "intent_id"),
-                                      _identifier(document, "effect_id", False))
-        if recovery == "receipt" and not identity.effect:
-            raise ProtocolError("effect_id is required for receipt recovery")
-        release = document.get("runnable")
-        keys = {"name", "module", "workspace", "version"}
-        if not isinstance(release, dict) or release.keys() != keys:
-            raise ProtocolError("request.runnable requires name, module, workspace and version")
-        if any(not isinstance(v, str) or not v for v in release.values()):
-            raise ProtocolError("request.runnable identity fields must be nonempty strings")
-        if any(release.get(key) != value for key, value in expected.items()):
-            raise ProtocolError("request names another Runnable release")
-        deadline = _instant(document.get("deadline"), "deadline")
-        issued = _instant(document.get("issued_at"), "issued_at")
-        if deadline <= issued:
-            raise ProtocolError("request.deadline must be after issued_at")
-        encoded = document.get("input")
-        try:
-            if not isinstance(encoded, str):
-                raise ValueError("input must be base64 text")
-            payload_bytes = base64.b64decode(encoded, validate=True)
-        except (ValueError, binascii.Error) as err:
-            raise ProtocolError(f"request.input is not base64: {err}") from err
-        if len(payload_bytes) > max_input_bytes:
-            raise ProtocolError(f"input is {len(payload_bytes)} bytes, over the declared {max_input_bytes} byte bound")
-        payload = _json(payload_bytes)
-        if not isinstance(payload, dict):
-            raise ProtocolError("request.input must decode to one JSON object")
-        return Request(identity, RunnableIdentity(**release), deadline, payload)
-
-
-def _instant(raw: Any, field: str) -> datetime:
-    if not isinstance(raw, str) or not raw:
-        raise ProtocolError(f"request.{field} is required")
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})", raw):
-        raise ProtocolError(f"request.{field} is not an RFC 3339 instant")
+    The bound is on the document that is actually sent, so it is measured after
+    encoding rather than estimated from the value.
+    """
+    if not isinstance(output, dict):
+        raise ProtocolError(f"handler returned {type(output).__name__}, expected an object")
     try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+        encoded = json.dumps(
+            output, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+    except (TypeError, ValueError) as err:
+        raise ProtocolError(f"output is not JSON: {err}") from err
+    if len(encoded) > max_output_bytes:
+        raise ProtocolError(f"output is {len(encoded)} bytes, over the declared {max_output_bytes} byte bound")
+    return encoded
+
+
+def _instant(raw: str) -> datetime:
+    """Read an RFC 3339 instant, as the deadline header spells one."""
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError as err:
-        raise ProtocolError(f"request.{field} is not an RFC 3339 instant") from err
-
-
-def completion_document(*, identity: InvocationIdentity, output: dict | None = None,
-                        failure: HandlerFailure | None = None, interrupted: bool = False) -> dict:
-    document = {"protocol": PROTOCOL, "invocation_id": identity.invocation}
-    if interrupted:
-        document.update(status="INTERRUPTED")
-    elif failure is not None:
-        document.update(status="FAILED", error={"code": failure.code, "message": str(failure)})
-    else:
-        payload = json.dumps(output, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
-        document.update(status="SUCCEEDED", output=base64.b64encode(payload).decode("ascii"))
-    return document
-
-
-def write_completion(path: str, document: dict, max_output_bytes: int) -> None:
-    if document["status"] == "SUCCEEDED" and len(base64.b64decode(document["output"])) > max_output_bytes:
-        raise ProtocolError(f"output exceeds the declared {max_output_bytes} byte bound")
-    encoded = json.dumps(document, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
-    staging = None
-    try:
-        with tempfile.NamedTemporaryFile(dir=os.path.dirname(path), prefix=".result-", delete=False) as handle:
-            staging = handle.name
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        # The rename carries the staging file's mode onto the result, and a
-        # temporary file is private to this process. Whether a launcher reads
-        # the result under another account is the facility's choice, not one
-        # the harness should make for it by leaving the mode at 0600.
-        os.chmod(staging, RESULT_MODE)
-        os.replace(staging, path)
-    finally:
-        if staging and os.path.exists(staging):
-            os.unlink(staging)
+        raise ProtocolError(f"{DEADLINE_HEADER} is not an RFC 3339 instant") from err
+    if parsed.tzinfo is None:
+        raise ProtocolError(f"{DEADLINE_HEADER} carries no offset, so it names no instant")
+    return parsed.astimezone(timezone.utc)

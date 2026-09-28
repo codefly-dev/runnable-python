@@ -26,7 +26,7 @@ agent:
   version: 0.0.2
   publisher: codefly.dev
 contract:
-  protocol: codefly.runnable/v1
+  protocol: codefly.runnable.served/v1
   input:
     fields:
       - name: amount
@@ -39,7 +39,7 @@ entrypoint:
   handler: handler.py
   inputs: [uv.lock, pyproject.toml]
 execution:
-  facilities: [native]
+  facilities: [generated-service]
   timeout: 30s
   cancellation: signal
   recovery: receipt
@@ -98,6 +98,12 @@ func TestTheConfigurationDigestFollowsWhatAnInvocationIsBoundTo(t *testing.T) {
 	}
 	if relaxed := digestFor(t, strings.Replace(declaration, "timeout: 30s", "timeout: 5m", 1)); relaxed == base {
 		t.Error("a different execution bound did not move the configuration digest")
+	}
+	// Two packages differing only in how their answer arrives are called the
+	// same way and answered differently, so the mode has to reach the digest.
+	if submitted := digestFor(t, strings.Replace(declaration,
+		"recovery: receipt", "recovery: receipt\n  completion: submit", 1)); submitted == base {
+		t.Error("declaring another completion mode did not move the configuration digest")
 	}
 }
 

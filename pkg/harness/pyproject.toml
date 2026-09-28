@@ -1,7 +1,7 @@
 [project]
 name = "codefly-runnable"
 version = "0.0.1"
-description = "The codefly.runnable/v1 harness generated into every Python runnable"
+description = "The codefly.runnable.served/v1 harness served by every Python runnable"
 requires-python = ">=3.11"
 dependencies = []
 

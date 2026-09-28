@@ -1,11 +1,17 @@
-"""The harness under real processes: one request in, one bound completion out."""
+"""The harness under real processes: it serves, and one call is one POST.
 
-import base64
-import json
+Every test here starts the harness the way a placement starts it — an allocated
+address in the environment, nothing else — and calls it over HTTP the way the
+runtime's invoker does. What a caller concludes from each answer is core's
+judgement, not this suite's, so the properties asserted are the ones core reads:
+the failure-code header, the status, and the answer document.
+"""
 
-import pytest
+import signal
+import threading
+import time
 
-from conftest import IDENTITY, RUNNABLE
+from conftest import LOOKUP, RUNNABLE, WORK_CONTEXT
 
 COUNT_CONTRACT = {
     "input": {
@@ -26,267 +32,162 @@ def handle(context, input):
 """
 
 
-def test_typed_output_depends_on_every_input(runnable):
-    unit = runnable(COUNT_HANDLER, **COUNT_CONTRACT)
+def test_the_harness_serves_rather_than_answering_once(runnable):
+    unit = runnable(COUNT_HANDLER, **COUNT_CONTRACT).serve()
 
-    single = unit.invoke({"text": "one two three", "double": False})
-    doubled = unit.invoke({"text": "one two three", "double": True})
-    shorter = unit.invoke({"text": "one two", "double": False})
+    single = unit.call({"text": "one two three", "double": False})
+    doubled = unit.call({"text": "one two three", "double": True})
+    shorter = unit.call({"text": "one two", "double": False})
 
-    assert single.exit_code == 0
-    assert single.completion["status"] == "SUCCEEDED"
-    assert single.completion["output"] == {"count": 3}
-    assert doubled.completion["output"] == {"count": 6}
-    assert shorter.completion["output"] == {"count": 2}
-
-
-def test_completion_is_bound_to_the_requested_identity(runnable):
-    unit = runnable(COUNT_HANDLER, **COUNT_CONTRACT)
-
-    result = unit.invoke({"text": "a b", "double": False})
-
-    assert result.completion["invocation_id"] == IDENTITY["invocation_id"]
-    assert result.completion["protocol"] == "codefly.runnable/v1"
+    assert single.status == 200
+    assert single.document() == {"count": 3}
+    assert doubled.document() == {"count": 6}
+    assert shorter.document() == {"count": 2}
 
 
-def test_invalid_input_is_refused_before_the_handler_runs(runnable):
+def test_the_answer_is_the_bounded_output_document_itself(runnable):
+    unit = runnable(COUNT_HANDLER, **COUNT_CONTRACT).serve()
+
+    answer = unit.call({"text": "a b", "double": False})
+
+    # No Codefly envelope around it: a field Codefly added to an owner's body
+    # would be a field the owner never described.
+    assert answer.document() == {"count": 2}
+
+
+def test_only_the_handlers_own_failure_proves_no_effect_committed(runnable):
+    """The property the whole taxonomy rests on.
+
+    The failure-code header, and nothing else, tells a caller that no effect
+    committed. A harness that set it for a crash, an untyped error or a deadline
+    would be asserting on the handler's behalf that its effect did not happen,
+    and a caller would stop looking for a receipt that exists.
+    """
+    unit = runnable(
+        """
+from codefly_runnable import HandlerFailure
+
+def handle(context, input):
+    if input["text"] == "declared":
+        raise HandlerFailure("card_declined", "the issuer declined")
+    if input["text"] == "untyped":
+        raise RuntimeError("something went wrong")
+    if input["text"] == "exit":
+        raise SystemExit(3)
+    return {"count": 1}
+""",
+        **COUNT_CONTRACT,
+    ).serve()
+
+    declared = unit.call({"text": "declared", "double": False})
+    assert declared.proven_no_effect
+    assert declared.failure_code == "card_declined"
+    assert declared.status == 422
+
+    for text in ("untyped", "exit"):
+        answer = unit.call({"text": text, "double": False})
+        assert not answer.proven_no_effect, f"{text} must leave the effect unproven"
+        assert answer.status == 500
+
+
+def test_a_call_with_no_work_context_is_refused(runnable):
+    """The one thing the required identity slot exists to prevent.
+
+    A call carrying no capability is refused rather than run under whatever
+    identity this process happens to have.
+    """
     unit = runnable(
         """
 def handle(context, input):
     raise AssertionError("the handler must not be reached")
 """,
         **COUNT_CONTRACT,
-    )
+    ).serve()
 
-    result = unit.invoke({"text": "a b", "double": 1})
+    answer = unit.call({"text": "a b", "double": False}, headers={"X-Codefly-Work-Context": None})
 
-    assert result.exit_code == 64
-    assert result.completion is None
-    assert "must be a boolean" in result.stderr
+    assert answer.status == 400
+    assert not answer.proven_no_effect
+    assert "Work Context" in answer.document()["message"]
 
 
-def test_invalid_output_is_reported_as_its_own_outcome(runnable):
+def test_the_handler_sees_the_callers_identity(runnable):
+    """The only thing a handler may do with a Work Context is forward it.
+
+    Parsing or reconstructing one is not the harness's business and it never
+    does either: the capability is carried verbatim.
+    """
     unit = runnable(
         """
 def handle(context, input):
-    return {"count": "three"}
+    return {"seen": context.invocation.work_context + "|" + context.invocation.effect
+                    + "|" + context.runnable.name + "|" + str(context.remaining() > 0)}
+
+
+def receipt_of(context, input):
+    return None
 """,
-        **COUNT_CONTRACT,
-    )
+        input=COUNT_CONTRACT["input"],
+        output={"fields": [{"name": "seen", "type": "string"}]},
+        recovery="receipt",
+    ).serve()
 
-    result = unit.invoke({"text": "a b c", "double": False})
+    seen = unit.call({"text": "a", "double": False}).document()["seen"]
 
-    assert result.exit_code == 65
-    assert result.completion is None
-    assert "output.count must be an integer" in result.stderr
-
-
-def test_a_handler_returning_a_non_object_is_invalid_output(runnable):
-    unit = runnable(
-        """
-def handle(context, input):
-    return 3
-""",
-        **COUNT_CONTRACT,
-    )
-
-    result = unit.invoke({"text": "a b c", "double": False})
-
-    assert result.exit_code == 65
-    assert "expected an object" in result.stderr
+    assert seen == f"{WORK_CONTEXT}|effect-64c0|{RUNNABLE['name']}|True"
 
 
-def test_a_raising_handler_fails_without_an_output(runnable):
-    unit = runnable(
-        """
-def handle(context, input):
-    raise RuntimeError("upstream refused")
-""",
-        **COUNT_CONTRACT,
-    )
-
-    result = unit.invoke({"text": "a b", "double": False})
-
-    assert result.exit_code == 66
-    assert result.completion is None
-    assert "upstream refused" in result.stderr
-
-
-def test_an_exiting_handler_is_a_failure_not_a_success(runnable):
-    unit = runnable(
-        """
-import sys
-
-def handle(context, input):
-    sys.exit(0)
-""",
-        **COUNT_CONTRACT,
-    )
-
-    result = unit.invoke({"text": "a b", "double": False})
-
-    assert result.exit_code == 66
-    assert result.completion is None
-
-
-def test_a_handler_past_the_deadline_times_out(runnable):
-    unit = runnable(
-        """
-import time
-
-def handle(context, input):
-    time.sleep(30)
-    return {"count": 0}
-""",
-        **COUNT_CONTRACT,
-    )
-
-    result = unit.invoke({"text": "a b", "double": False}, deadline_in=1.0)
-
-    assert result.exit_code == 67
-    assert result.completion is None
-
-
-def test_a_deadline_already_passed_never_starts_the_handler(runnable):
+def test_the_payload_is_checked_before_the_handler_runs(runnable):
     unit = runnable(
         """
 def handle(context, input):
     raise AssertionError("the handler must not be reached")
 """,
         **COUNT_CONTRACT,
-    )
+    ).serve()
 
-    result = unit.invoke({"text": "a b", "double": False}, deadline_in=-1.0)
-
-    assert result.exit_code == 67
-    assert result.completion is None
-    assert "before the handler started" in result.stderr
-
-
-def test_a_swallowed_deadline_is_still_a_timeout(runnable):
-    unit = runnable(
-        """
-import time
-
-def handle(context, input):
-    try:
-        time.sleep(30)
-    except BaseException:
-        pass
-    return {"count": 99}
-""",
-        **COUNT_CONTRACT,
-    )
-
-    result = unit.invoke({"text": "a b", "double": False}, deadline_in=1.0)
-
-    assert result.exit_code == 67
-    assert result.completion is None
+    for payload, raw in (
+        ({"double": False}, None),                                  # a missing required field
+        ({"text": "a", "double": False, "extra": 1}, None),         # an undeclared field
+        ({"text": 1, "double": False}, None),                       # the wrong value type
+        ({"text": None, "double": False}, None),                    # a null where none is declared
+        (None, b'["text"]'),                                        # a body that is not an object
+        (None, b"{not json"),                                       # a body that is not JSON
+        (None, b'{"text":"a","text":"b","double":false}'),          # a repeated key
+    ):
+        answer = unit.call(payload, raw=raw)
+        assert answer.status == 400, answer.body
+        assert not answer.proven_no_effect, "a refused payload is not the operation's own failure"
 
 
-def test_an_interrupted_invocation_reports_interrupted(runnable):
-    unit = runnable(
-        """
-import time
-
-def handle(context, input):
-    time.sleep(30)
-    return {"count": 0}
-""",
-        **COUNT_CONTRACT,
-    )
-
-    result = unit.invoke({"text": "a b", "double": False}, interrupt_after=1.0)
-
-    assert result.exit_code == 68
-    assert result.completion["status"] == "INTERRUPTED"
-    assert "output" not in result.completion
-
-
-def test_a_swallowed_interruption_is_still_interrupted(runnable):
-    unit = runnable(
-        """
-import time
-
-def handle(context, input):
-    try:
-        time.sleep(30)
-    except BaseException:
-        pass
-    return {"count": 99}
-""",
-        **COUNT_CONTRACT,
-    )
-
-    result = unit.invoke({"text": "a b", "double": False}, interrupt_after=1.0)
-
-    assert result.exit_code == 68
-    assert result.completion["status"] == "INTERRUPTED"
-    assert "output" not in result.completion
-
-
-def test_exit_zero_without_a_completion_leaves_nothing_to_read(runnable):
-    unit = runnable(
-        """
-import os
-
-def handle(context, input):
-    os._exit(0)
-""",
-        **COUNT_CONTRACT,
-    )
-
-    result = unit.invoke({"text": "a b", "double": False})
-
-    assert result.exit_code == 0
-    assert result.completion is None
-
-
-def test_logs_stay_out_of_the_completion(runnable):
-    unit = runnable(
-        """
-import sys
-
-def handle(context, input):
-    print("handler progress")
-    print("handler diagnostic", file=sys.stderr)
-    context.log("context diagnostic")
-    return {"count": 1}
-""",
-        **COUNT_CONTRACT,
-    )
-
-    result = unit.invoke({"text": "a", "double": False})
-
-    assert result.completion["output"] == {"count": 1}
-    assert "handler progress" in result.stdout
-    assert "handler diagnostic" in result.stderr
-    assert "context diagnostic" in result.stderr
-    assert "progress" not in json.dumps(result.completion)
-
-
-def test_logs_are_truncated_at_the_declared_bound(runnable):
+def test_an_answer_the_contract_refuses_is_not_a_success(runnable):
     unit = runnable(
         """
 def handle(context, input):
-    for _ in range(200):
-        print("x" * 100)
-    return {"count": 1}
+    if input["text"] == "wrong-type":
+        return {"count": "three"}
+    if input["text"] == "not-an-object":
+        return [1, 2, 3]
+    return {"count": 1, "undeclared": True}
 """,
         **COUNT_CONTRACT,
-        **{"max-log-bytes": 4096},
-    )
+    ).serve()
 
-    result = unit.invoke({"text": "a", "double": False})
+    for text in ("wrong-type", "not-an-object", "undeclared"):
+        answer = unit.call({"text": text, "double": False})
+        assert answer.status == 500, answer.body
+        # The effect may well have committed before the answer was spoiled, so
+        # this is unproven rather than the operation's own failure.
+        assert not answer.proven_no_effect
 
-    assert result.exit_code == 0
-    assert result.completion["output"] == {"count": 1}
-    assert "log truncated at 4096 bytes" in result.stdout
-    assert len(result.stdout) < 8192
 
+def test_the_bounds_are_the_declared_ones(runnable):
+    over_input = runnable(COUNT_HANDLER, **COUNT_CONTRACT, **{"max-input-bytes": 256}).serve()
+    answer = over_input.call({"text": "x" * 4096, "double": False})
+    assert answer.status == 400
+    assert "over the declared 256 byte bound" in answer.document()["message"]
 
-def test_an_output_over_the_bound_is_invalid_output(runnable):
-    unit = runnable(
+    over_output = runnable(
         """
 def handle(context, input):
     return {"text": "x" * 4096}
@@ -294,318 +195,201 @@ def handle(context, input):
         input={},
         output={"fields": [{"name": "text", "type": "string"}]},
         **{"max-output-bytes": 1024},
-    )
-
-    result = unit.invoke({})
-
-    assert result.exit_code == 65
-    assert result.completion is None
+    ).serve()
+    answer = over_output.call({})
+    assert answer.status == 500
+    assert "over the declared 1024 byte bound" in answer.document()["message"]
 
 
-def test_a_request_over_the_bound_never_reaches_the_contract(runnable):
-    unit = runnable(COUNT_HANDLER, **COUNT_CONTRACT, **{"max-input-bytes": 256})
-
-    result = unit.invoke({"text": "x" * 4096, "double": False})
-
-    assert result.exit_code == 69
-    assert result.completion is None
-    assert "over the declared 256 byte bound" in result.stderr
-
-
-def test_a_malformed_request_is_a_protocol_error(runnable):
-    unit = runnable(COUNT_HANDLER, **COUNT_CONTRACT)
-
-    result = unit.invoke(None, raw_request=b"{not json")
-
-    assert result.exit_code == 69
-    assert result.completion is None
-    assert "not UTF-8 JSON" in result.stderr
-
-
-def test_a_request_without_a_deadline_is_refused(runnable):
-    unit = runnable(COUNT_HANDLER, **COUNT_CONTRACT)
-
-    result = unit.invoke({}, request_overrides={"deadline": None})
-
-    assert result.exit_code == 69
-    assert "deadline is required" in result.stderr
-
-
-def test_a_request_of_another_protocol_is_refused(runnable):
-    unit = runnable(COUNT_HANDLER, **COUNT_CONTRACT)
-
-    result = unit.invoke({}, request_overrides={"protocol": "codefly.runnable/v2"})
-
-    assert result.exit_code == 69
-    assert "is not 'codefly.runnable/v1'" in result.stderr
-
-
-def test_a_missing_completion_path_refuses_to_run(runnable):
-    unit = runnable(COUNT_HANDLER, **COUNT_CONTRACT)
-
-    result = unit.invoke(
-        {"text": "a", "double": False},
-        environment={"CODEFLY__RUNNABLE_RESULT": None},
-    )
-
-    assert result.exit_code == 69
-    assert "CODEFLY__RUNNABLE_RESULT is required" in result.stderr
-
-
-def test_a_handler_that_cannot_be_imported_fails(runnable):
+def test_the_deadline_header_bounds_the_call(runnable):
     unit = runnable(
         """
-import a_module_that_does_not_exist
-
-def handle(context, input):
-    return {"count": 1}
-""",
-        **COUNT_CONTRACT,
-    )
-
-    result = unit.invoke({"text": "a", "double": False})
-
-    assert result.exit_code == 66
-    assert result.completion is None
-
-
-def test_the_handler_receives_the_caller_identity_and_deadline(runnable):
-    unit = runnable(
-        """
-def handle(context, input):
-    assert context.invocation.invocation == "inv-7f3a"
-    assert context.invocation.intent == "intent-2b19"
-    assert context.invocation.effect == ""
-    assert context.runnable.version == "0.1.0"
-    assert 0 < context.remaining() <= 20
-    assert context.recovery == "recompute"
-    return {"count": 1}
-""",
-        **COUNT_CONTRACT,
-    )
-
-    result = unit.invoke({"text": "a", "double": False})
-
-    assert result.exit_code == 0, result.stderr
-    assert result.completion["status"] == "SUCCEEDED"
-
-
-def test_payload_limit_excludes_framing(runnable):
-    unit = runnable("def handle(context, input):\n    return {}\n",
-                    **{"max-input-bytes": 2})
-    result = unit.invoke({})
-    assert result.exit_code == 0, result.stderr
-    assert result.completion["output"] == {}
-
-
-def test_expired_request_never_imports_author_code(runnable):
-    unit = runnable('''
-from pathlib import Path
-Path(__file__).with_name("imported").write_text("author code ran")
-def handle(context, input):
-    return {}
-''')
-    result = unit.invoke({}, deadline_in=-1)
-    assert result.exit_code == 67
-    assert not (unit.root / "imported").exists()
-
-
-def test_deadline_covers_author_imports(runnable):
-    unit = runnable('''
 import time
-time.sleep(30)
-def handle(context, input):
-    return {}
-''')
-    result = unit.invoke({}, deadline_in=0.3, timeout=3)
-    assert result.exit_code == 67
-    assert result.completion is None
 
-
-def test_cleanup_error_preserves_timeout(runnable):
-    unit = runnable('''
-import time
-def handle(context, input):
-    try:
-        time.sleep(30)
-    except Exception:
-        raise ValueError("cleanup failed")
-''')
-    result = unit.invoke({}, deadline_in=0.3)
-    assert result.exit_code == 67
-    assert result.completion is None
-    assert "cleanup failed" in result.stderr
-
-
-def test_invalid_return_preserves_interruption(runnable):
-    unit = runnable('''
-import time
-def handle(context, input):
-    try:
-        time.sleep(30)
-    except Exception:
-        return None
-''')
-    result = unit.invoke({}, interrupt_after=0.3)
-    assert result.exit_code == 68
-    assert result.completion["status"] == "INTERRUPTED"
-    assert "output" not in result.completion
-
-
-def test_file_descriptor_and_subprocess_logs_are_bounded(runnable):
-    unit = runnable('''
-import os
-import subprocess
-import sys
-def handle(context, input):
-    os.write(1, b"x" * 10000)
-    subprocess.run([sys.executable, "-c", "import os; os.write(2, b'y' * 10000)"], check=True)
-    return {}
-''', **{"max-log-bytes": 1024})
-    result = unit.invoke({})
-    assert result.exit_code == 0, result.stderr
-    for stream in (result.stdout, result.stderr):
-        assert "log truncated at 1024 bytes" in stream
-        assert len(stream.encode()) < 1100
-
-
-def test_explicit_operation_failure_is_the_only_certain_failure(runnable):
-    unit = runnable("""
-from codefly_runnable import HandlerFailure
-def handle(context, input):
-    raise HandlerFailure("unavailable", "the operation was refused")
-""")
-    result = unit.invoke({})
-    assert result.exit_code == 66
-    assert result.completion["status"] == "FAILED"
-    assert result.completion["error"] == {"code": "unavailable", "message": "the operation was refused"}
-    assert "output" not in result.completion
-
-
-@pytest.mark.parametrize("overrides", [
-    {"intent_id": ""},
-    {"invocation_id": "x" * 129},
-    {"runnable": dict(RUNNABLE, version="9.0.0")},
-    {"input": "!not-base64!"},
-    {"input": base64.b64encode(b'{"x":1,"x":2}').decode()},
-])
-def test_invalid_framing_never_imports_author_code(runnable, overrides):
-    unit = runnable("raise AssertionError('author code ran')")
-    result = unit.invoke({}, request_overrides=overrides)
-    assert result.exit_code == 69
-    assert result.completion is None
-    assert "author code ran" not in result.stderr
-
-
-def test_input_bound_applies_to_exact_decoded_bytes(runnable):
-    unit = runnable("def handle(context, input): return {}", **{"max-input-bytes": 2})
-    result = unit.invoke({}, request_overrides={"input": base64.b64encode(b'{  }').decode()})
-    assert result.exit_code == 69
-    assert "input is 4 bytes" in result.stderr
-
-
-def test_receipt_requires_and_passes_the_effect_identity(runnable):
-    unit = runnable("""
-def handle(context, input):
-    assert context.invocation.effect == "effect-64c0"
-    return {}
-""", recovery="receipt")
-    assert unit.invoke({}).exit_code == 0
-    result = unit.invoke({}, request_overrides={"effect_id": ""})
-    assert result.exit_code == 69
-    assert result.completion is None
-
-
-def test_a_chatty_handler_cannot_evict_the_reason_it_failed(runnable):
-    """An uncertain outcome writes no result, so stderr carries the only reason.
-
-    The handler must not be able to spend the log budget and push it out.
-    """
-    unit = runnable('''
-import sys
-def handle(context, input):
-    sys.stderr.write("N" * 40000)
-    return {"count": "not-an-integer"}
-''', **COUNT_CONTRACT, **{"max-log-bytes": 1024})
-
-    result = unit.invoke({"text": "a b", "double": False})
-
-    assert result.exit_code == 65
-    assert result.completion is None
-    assert "log truncated at 1024 bytes" in result.stderr
-    assert "output.count must be an integer" in result.stderr
-
-
-def test_an_uncertain_outcome_clears_an_earlier_result(runnable):
-    """A result document is this run's or it is nothing.
-
-    A launcher that reuses the result path would otherwise read the previous
-    attempt's SUCCEEDED document as this timed-out invocation's proven result.
-    """
-    unit = runnable('''
-import os, time
-def handle(context, input):
-    if os.environ.get("SLOW"):
-        time.sleep(30)
-    return {"count": 1}
-''', **COUNT_CONTRACT)
-
-    first = unit.invoke({"text": "a", "double": False})
-    assert first.exit_code == 0, first.stderr
-    assert first.completion["status"] == "SUCCEEDED"
-
-    second = unit.invoke(
-        {"text": "a", "double": False}, deadline_in=1.0, environment={"SLOW": "1"}
-    )
-
-    assert second.exit_code == 67
-    assert second.completion is None
-    assert not (unit.generated / "completion.json").exists()
-
-
-def test_invalid_framing_clears_an_earlier_result(runnable):
-    """Framing is refused before the request is read, so the stale document
-    must already be gone by then."""
-    unit = runnable(COUNT_HANDLER, **COUNT_CONTRACT)
-
-    assert unit.invoke({"text": "a", "double": False}).exit_code == 0
-    result = unit.invoke({}, request_overrides={"protocol": "codefly.runnable/v2"})
-
-    assert result.exit_code == 69
-    assert result.completion is None
-    assert not (unit.generated / "completion.json").exists()
-
-
-def test_the_result_is_readable_by_the_launcher(runnable):
-    """The launcher that reads the result may not be the account that wrote it."""
-    import stat
-
-    unit = runnable(COUNT_HANDLER, **COUNT_CONTRACT)
-
-    result = unit.invoke({"text": "a b", "double": False})
-
-    assert result.exit_code == 0, result.stderr
-    mode = (unit.generated / "completion.json").stat().st_mode
-    assert stat.S_IMODE(mode) == 0o644
-
-
-def test_recompute_accepts_an_effect_identity(runnable):
-    unit = runnable("""
-def handle(context, input):
-    return {"effect": context.invocation.effect}
-""", output={"fields": [{"name": "effect", "type": "string"}]})
-    result = unit.invoke({}, request_overrides={"effect_id": "shared-effect"})
-    assert result.exit_code == 0
-    assert result.completion["output"] == {"effect": "shared-effect"}
-
-
-def test_cancellation_none_does_not_claim_a_handled_signal(runnable):
-    unit = runnable("""
-import time
 def handle(context, input):
     time.sleep(30)
-    return {}
-""", cancellation="none")
-    result = unit.invoke({}, interrupt_after=0.5)
-    assert result.exit_code == -15
-    assert result.completion is None
+    return {"count": 0}
+""",
+        **COUNT_CONTRACT,
+    ).serve()
+
+    answer = unit.call({"text": "a", "double": False}, headers=unit.deadline_in(2))
+    assert answer.status == 504
+    assert not answer.proven_no_effect, "a deadline leaves the effect unproven"
+
+    # A deadline already in the past never starts the handler: spending the
+    # attempt would make a timeout look like work that happened.
+    past = unit.call({"text": "a", "double": False}, headers=unit.deadline_in(-60))
+    assert past.status == 400
+    assert "deadline had passed" in past.document()["message"]
+
+
+def test_a_deadline_cannot_extend_the_declared_timeout(runnable):
+    """A caller may shorten the author's bound and never overrule it."""
+    unit = runnable(
+        """
+import time
+
+def handle(context, input):
+    time.sleep(30)
+    return {"count": 0}
+""",
+        **COUNT_CONTRACT,
+        **{"timeout-nanoseconds": 2_000_000_000},
+    ).serve()
+
+    started = time.monotonic()
+    answer = unit.call({"text": "a", "double": False}, headers=unit.deadline_in(600))
+
+    assert answer.status == 504
+    assert time.monotonic() - started < 20, "the declared timeout did not bound the call"
+
+
+def test_concurrent_calls_are_independent(runnable):
+    unit = runnable(
+        """
+import time
+
+def handle(context, input):
+    time.sleep(0.5)
+    return {"count": len(input["text"])}
+""",
+        **COUNT_CONTRACT,
+    ).serve()
+
+    answers = {}
+
+    def call(index: int) -> None:
+        answers[index] = unit.call({"text": "x" * index, "double": False})
+
+    threads = [threading.Thread(target=call, args=(index,)) for index in range(1, 5)]
+    started = time.monotonic()
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    elapsed = time.monotonic() - started
+
+    assert {index: answer.document()["count"] for index, answer in answers.items()} == {1: 1, 2: 2, 3: 3, 4: 4}
+    assert elapsed < 2, "the calls were served one after another"
+
+
+def test_a_receipt_recovery_package_serves_the_receipt_route(runnable):
+    """Absent is "not yet known", never "no"."""
+    unit = runnable(
+        """
+def handle(context, input):
+    return {"count": 1}
+
+
+def receipt_of(context, input):
+    if input["text"] == "committed":
+        return {"count": 7}
+    return None
+""",
+        **COUNT_CONTRACT,
+        recovery="receipt",
+    ).serve()
+
+    found = unit.call({"text": "committed", "double": False}, procedure=LOOKUP)
+    assert found.status == 200
+    assert found.document() == {"count": 7}
+
+    absent = unit.call({"text": "never", "double": False}, procedure=LOOKUP)
+    assert absent.status == 404
+    assert absent.document()["code"] == "not_found"
+    assert not absent.proven_no_effect, "an absent receipt is inconclusive, never proof"
+
+    # An effect identity is what a receipt is keyed by, so a receipt-recovery
+    # call carrying none is refused rather than run.
+    none = unit.call({"text": "a", "double": False}, headers={"Codefly-Runnable-Effect-Id": None})
+    assert none.status == 400
+    assert "effect identity" in none.document()["message"]
+
+
+def test_a_recompute_package_serves_no_receipt_route(runnable):
+    """It has nothing to look up, so the route is absent rather than answering "never"."""
+    unit = runnable(COUNT_HANDLER, **COUNT_CONTRACT).serve()
+
+    answer = unit.call({"text": "a", "double": False}, procedure=LOOKUP)
+
+    assert answer.status == 404
+    assert answer.document()["code"] == "unimplemented"
+
+
+def test_a_receipt_package_without_a_lookup_refuses_to_start(runnable):
+    """The refusal is at startup, not at the call that needed it.
+
+    An owner serving no receipt cannot report an effect it did commit, and a
+    caller reads that silence as inconclusive forever.
+    """
+    unit = runnable(COUNT_HANDLER, **COUNT_CONTRACT, recovery="receipt").serve(wait=False)
+
+    assert unit.exit_code() == 1
+    assert "receipt_of" in unit.diagnostics()
+
+
+def test_the_harness_cannot_choose_its_own_address(runnable):
+    unit = runnable(COUNT_HANDLER, **COUNT_CONTRACT).serve(
+        wait=False, environment={"CODEFLY__RUNNABLE_ADDRESS": None}
+    )
+
+    assert unit.exit_code() == 1
+    assert "CODEFLY__RUNNABLE_ADDRESS is required" in unit.diagnostics()
+
+
+def test_a_contract_of_another_protocol_is_refused(runnable):
+    unit = runnable(COUNT_HANDLER, **COUNT_CONTRACT, protocol="codefly.runnable/v1").serve(wait=False)
+
+    assert unit.exit_code() == 1
+    assert "codefly.runnable.served/v1" in unit.diagnostics()
+
+
+def test_a_handler_that_cannot_be_imported_refuses_to_start(runnable):
+    unit = runnable("import nonexistent_module\n", **COUNT_CONTRACT).serve(wait=False)
+
+    assert unit.exit_code() == 1
+    assert "nonexistent_module" in unit.diagnostics()
+
+
+def test_a_call_in_flight_is_given_its_grace(runnable):
+    """Cutting calls off at a signal would make every one of them unproven at once."""
+    unit = runnable(
+        """
+import time
+
+def handle(context, input):
+    time.sleep(2)
+    return {"count": 42}
+""",
+        **COUNT_CONTRACT,
+    ).serve()
+
+    answers = []
+    caller = threading.Thread(target=lambda: answers.append(unit.call({"text": "a", "double": False})))
+    caller.start()
+    time.sleep(0.5)
+    unit.process.send_signal(signal.SIGTERM)
+    caller.join(30)
+
+    assert answers and answers[0].status == 200
+    assert answers[0].document() == {"count": 42}
+    assert unit.exit_code() == 0, "the signalled harness ended on its own once the call had finished"
+
+
+def test_logs_never_carry_completion_data(runnable):
+    """A handler that printed its output would be indistinguishable from a library that printed a warning."""
+    unit = runnable(
+        """
+def handle(context, input):
+    print("diagnostic on stdout")
+    context.log("diagnostic on stderr")
+    return {"count": 1}
+""",
+        **COUNT_CONTRACT,
+    ).serve()
+
+    answer = unit.call({"text": "a", "double": False})
+
+    assert answer.document() == {"count": 1}
+    assert "diagnostic" not in answer.body

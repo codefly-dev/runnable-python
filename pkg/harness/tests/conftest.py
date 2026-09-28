@@ -1,9 +1,12 @@
-import base64
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,28 +15,42 @@ import pytest
 
 PACKAGE = Path(__file__).resolve().parent.parent / "codefly_runnable"
 
-IDENTITY = {
-    "invocation_id": "inv-7f3a",
-    "intent_id": "intent-2b19",
-}
 RUNNABLE = {
     "name": "word-count",
     "module": "text",
     "workspace": "proof",
     "version": "0.1.0",
 }
+WORK_CONTEXT = "eyJ0eXAiOiJjb2RlZmx5LndvcmstY29udGV4dC92MSJ9.signed"
+
+INVOKE = "/codefly.runnable.v0.Runnable/Invoke"
+LOOKUP = "/codefly.runnable.v0.Runnable/Lookup"
 
 
 @dataclass
-class Invocation:
-    exit_code: int
-    stdout: str
-    stderr: str
-    completion: dict | None
+class Answer:
+    """What a caller saw of one call."""
+
+    status: int
+    body: str
+    failure_code: str
+
+    def document(self) -> dict:
+        return json.loads(self.body)
+
+    @property
+    def proven_no_effect(self) -> bool:
+        """Only the operation's own typed code proves nothing committed.
+
+        A status says nothing on its own, which is the property the whole
+        taxonomy rests on: a caller that read a 4xx as proof would stop looking
+        for a receipt that exists.
+        """
+        return bool(self.failure_code)
 
 
 class Runnable:
-    """A runnable materialized on disk exactly as the agent generates it."""
+    """A runnable materialized on disk exactly as the agent generates it, and served."""
 
     def __init__(self, root: Path, handler: str, contract: dict) -> None:
         self.root = root
@@ -44,52 +61,30 @@ class Runnable:
         (root / "handler.py").write_text(handler, encoding="utf-8")
         (generated / "contract.json").write_text(json.dumps(contract), encoding="utf-8")
         self.generated = generated
+        self.process: subprocess.Popen | None = None
+        self.host, self.port, self.address = "", 0, ""
 
-    def invoke(
-        self,
-        payload,
-        *,
-        timeout: float = 30.0,
-        deadline_in: float = 20.0,
-        interrupt_after: float | None = None,
-        environment: dict | None = None,
-        raw_request: bytes | None = None,
-        request_overrides: dict | None = None,
-    ) -> Invocation:
-        request = self.generated / "request.json"
-        completion = self.generated / "completion.json"
-        # Deliberately not cleared here: clearing a stale result is the
-        # harness's own obligation, and doing it for it would hide a document
-        # surviving into a run that reports none.
-        if raw_request is None:
-            deadline = datetime.now(timezone.utc) + timedelta(seconds=deadline_in)
-            document = {
-                    "protocol": "codefly.runnable/v1",
-                    **IDENTITY,
-                    **({"effect_id": "effect-64c0"} if self.contract["recovery"] == "receipt" else {}),
-                    "issued_at": (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat().replace("+00:00", "Z"),
-                    "runnable": RUNNABLE,
-                    "deadline": deadline.isoformat().replace("+00:00", "Z"),
-                    "input": base64.b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode(),
-                }
-            if request_overrides:
-                document.update(request_overrides)
-            raw_request = json.dumps(document).encode("utf-8")
-        request.write_bytes(raw_request)
+    def serve(self, *, environment: dict | None = None, wait: bool = True) -> "Runnable":
+        """Start the harness on a port the operating system chose.
+
+        Nothing here picks a number: the placement allocates the port and hands
+        it over, which is the one fact the harness cannot derive.
+        """
+        with socket.socket() as reserved:
+            reserved.bind(("127.0.0.1", 0))
+            self.host, self.port = "127.0.0.1", reserved.getsockname()[1]
+            self.address = f"{self.host}:{self.port}"
 
         env = dict(os.environ)
-        env["CODEFLY__RUNNABLE_INVOCATION"] = str(request)
-        env["CODEFLY__RUNNABLE_RESULT"] = str(completion)
-        env["CODEFLY__RUNNABLE_PROTOCOL"] = "codefly.runnable/v1"
+        env["CODEFLY__RUNNABLE_ADDRESS"] = self.address
         env["PYTHONPATH"] = str(self.generated)
-        if environment is not None:
-            for key, value in environment.items():
-                if value is None:
-                    env.pop(key, None)
-                else:
-                    env[key] = value
+        for key, value in (environment or {}).items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
 
-        process = subprocess.Popen(
+        self.process = subprocess.Popen(
             [sys.executable, "-m", "codefly_runnable"],
             cwd=self.generated,
             env=env,
@@ -97,37 +92,109 @@ class Runnable:
             stderr=subprocess.PIPE,
             text=True,
         )
-        if interrupt_after is not None:
+        if wait:
+            self._await()
+        return self
+
+    def _await(self) -> None:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                raise AssertionError(f"the harness exited with {self.process.returncode}\n{self.diagnostics()}")
             try:
-                process.wait(timeout=interrupt_after)
-            except subprocess.TimeoutExpired:
-                process.terminate()
-        stdout, stderr = process.communicate(timeout=timeout)
-        recorded = None
-        if completion.exists():
-            recorded = json.loads(completion.read_text(encoding="utf-8"))
-            if "output" in recorded:
-                recorded["output"] = json.loads(base64.b64decode(recorded["output"]))
-        return Invocation(process.returncode, stdout, stderr, recorded)
+                with socket.create_connection((self.host, self.port), 0.1):
+                    return
+            except OSError:
+                time.sleep(0.02)
+        raise AssertionError(f"the harness never answered on {self.address}\n{self.diagnostics()}")
+
+    def call(
+        self,
+        payload,
+        *,
+        procedure: str = INVOKE,
+        headers: dict | None = None,
+        raw: bytes | None = None,
+        timeout: float = 30.0,
+    ) -> Answer:
+        """Send one call the way the runtime's invoker sends one."""
+        body = raw if raw is not None else json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        sent = {"Content-Type": "application/json", "X-Codefly-Work-Context": WORK_CONTEXT}
+        if self.contract["recovery"] == "receipt":
+            sent["Codefly-Runnable-Effect-Id"] = "effect-64c0"
+        for key, value in (headers or {}).items():
+            if value is None:
+                sent.pop(key, None)
+            else:
+                sent[key] = value
+
+        request = urllib.request.Request(f"http://{self.address}{procedure}", data=body, headers=sent, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return Answer(response.status, response.read().decode("utf-8"),
+                              response.headers.get("Codefly-Runnable-Failure-Code", ""))
+        except urllib.error.HTTPError as refused:
+            return Answer(refused.status, refused.read().decode("utf-8"),
+                          refused.headers.get("Codefly-Runnable-Failure-Code", ""))
+
+    def deadline_in(self, seconds: float) -> dict:
+        instant = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        return {"Codefly-Runnable-Deadline": instant.isoformat().replace("+00:00", "Z")}
+
+    def exit_code(self, timeout: float = 45.0) -> int:
+        """Wait for a harness that ends on its own, and return its exit code.
+
+        A harness that refuses to serve exits rather than answering, so a test
+        of that refusal waits for the exit instead of stopping the process and
+        reading back the signal it sent itself.
+        """
+        assert self.process is not None
+        return self.process.wait(timeout=timeout)
+
+    def stop(self, signal_number: int | None = None) -> int:
+        if self.process is None:
+            return 0
+        if self.process.poll() is None:
+            self.process.send_signal(signal_number) if signal_number else self.process.terminate()
+        try:
+            self.process.wait(timeout=45)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=10)
+        return self.process.returncode
+
+    def diagnostics(self) -> str:
+        if self.process is None:
+            return ""
+        try:
+            return self.process.communicate(timeout=5)[1]
+        except subprocess.TimeoutExpired:
+            return ""
 
 
 @pytest.fixture
 def runnable(tmp_path):
+    served: list[Runnable] = []
+
     def build(handler: str, *, input=None, output=None, **overrides) -> Runnable:
         contract = {
             "schema": "codefly.runnable-generated-contract/v1",
-            "protocol": "codefly.runnable/v1",
+            "protocol": "codefly.runnable.served/v1",
             "runnable": RUNNABLE,
             "handler": {"module": "handler", "attribute": "handle"},
             "input": input or {},
             "output": output or {},
             "recovery": "recompute",
-            "cancellation": "signal",
             "max-input-bytes": 65536,
             "max-output-bytes": 65536,
-            "max-log-bytes": 262144,
+            "timeout-nanoseconds": 120_000_000_000,
         }
         contract.update(overrides)
-        return Runnable(tmp_path / "word-count", handler, contract)
+        instance = Runnable(tmp_path / f"word-count-{len(served)}", handler, contract)
+        served.append(instance)
+        return instance
 
-    return build
+    yield build
+
+    for instance in served:
+        instance.stop()
