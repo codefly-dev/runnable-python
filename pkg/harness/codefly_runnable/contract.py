@@ -32,6 +32,7 @@ class Contract:
     max_input_bytes: int
     max_output_bytes: int
     timeout_seconds: float
+    concurrency: int
     release: RunnableIdentity
 
     @staticmethod
@@ -48,6 +49,9 @@ class Contract:
         timeout = int(document["timeout-nanoseconds"])
         if timeout <= 0:
             raise ProtocolError(f"{path} declares no timeout, which bounds every call it answers")
+        concurrency = int(document["concurrency"])
+        if concurrency < 0:
+            raise ProtocolError(f"{path} declares a negative concurrency")
         return Contract(
             handler_module=document["handler"]["module"],
             handler_attribute=document["handler"]["attribute"],
@@ -58,6 +62,7 @@ class Contract:
             max_input_bytes=int(document["max-input-bytes"]),
             max_output_bytes=int(document["max-output-bytes"]),
             timeout_seconds=timeout / 1_000_000_000,
+            concurrency=concurrency,
         )
 
 

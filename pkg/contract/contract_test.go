@@ -6,8 +6,12 @@ import (
 	"strings"
 	"testing"
 
+	validate "buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go/buf/validate"
+	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
 	"github.com/codefly-dev/core/resources"
 	corerunnable "github.com/codefly-dev/core/runnable"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/codefly-dev/runnable-python/pkg/contract"
 	"github.com/codefly-dev/runnable-python/pkg/harness"
@@ -48,6 +52,34 @@ func TestTheFramingIsOneContract(t *testing.T) {
 	if runner := source(t, "codefly_runnable/runner.py"); !strings.Contains(
 		runner, "getattr(module, attribute") {
 		t.Error("the harness no longer resolves the handler through the generated contract")
+	}
+}
+
+// TestTheHeaderBoundsAreCoresBounds holds the harness's limits on the per-call
+// headers to the rules core validates the same values with. They live only in
+// core's proto, so they are read from its descriptors rather than remembered:
+// a harness admitting more than core would accept a call no caller core admits
+// could have sent, and one admitting less would refuse calls core says are
+// valid.
+func TestTheHeaderBoundsAreCoresBounds(t *testing.T) {
+	protocol := source(t, "codefly_runnable/protocol.py")
+	for _, bound := range []struct {
+		literal string
+		message proto.Message
+		field   protoreflect.Name
+	}{
+		{"MAX_WORK_CONTEXT_LENGTH", &basev0.RunnableInvocationIdentity{}, "work_context"},
+		{"MAX_EFFECT_ID_LENGTH", &basev0.RunnableInvocation{}, "effect_id"},
+	} {
+		field := bound.message.ProtoReflect().Descriptor().Fields().ByName(bound.field)
+		rules, _ := proto.GetExtension(field.Options(), validate.E_Field).(*validate.FieldRules)
+		limit := rules.GetString().GetMaxLen()
+		if limit == 0 {
+			t.Fatalf("core declares no max_len on %s", field.FullName())
+		}
+		if declaration := fmt.Sprintf("%s = %d", bound.literal, limit); !strings.Contains(protocol, declaration) {
+			t.Errorf("the harness does not declare %s, core's bound on %s", declaration, field.FullName())
+		}
 	}
 }
 

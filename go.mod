@@ -3,6 +3,7 @@ module github.com/codefly-dev/runnable-python
 go 1.27.2
 
 require (
+	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.12-20260825204119-511051f7f437.2
 	github.com/codefly-dev/core v0.19.4
 	github.com/stretchr/testify v1.12.1
 	google.golang.org/grpc v1.84.0
@@ -11,7 +12,6 @@ require (
 )
 
 require (
-	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.12-20260825204119-511051f7f437.2 // indirect
 	buf.build/go/protovalidate v1.4.0 // indirect
 	cel.dev/cel-go v0.32.0 // indirect
 	cel.dev/expr v0.25.3 // indirect

@@ -28,6 +28,44 @@ LOOKUP = "/codefly.runnable.v0.Runnable/Lookup"
 
 
 @dataclass
+class Exchange:
+    """Everything one raw connection received, and whether the harness closed it."""
+
+    received: bytes
+    closed: bool
+
+    @property
+    def responses(self) -> int:
+        return self.received.count(b"HTTP/1.1 ")
+
+    @property
+    def status(self) -> int:
+        return int(self.received.split(b" ", 2)[1])
+
+    def header(self, name: str) -> str:
+        head = self.received.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+        for line in head.split("\r\n")[1:]:
+            key, _, value = line.partition(":")
+            if key.strip().lower() == name.lower():
+                return value.strip()
+        return ""
+
+    def has_header(self, name: str) -> bool:
+        head = self.received.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+        return any(line.partition(":")[0].strip().lower() == name.lower() for line in head.split("\r\n")[1:])
+
+
+def request(body: bytes = b"", headers: list | None = None, *, procedure: str = INVOKE, length: bool = True) -> bytes:
+    """One request as bytes on the wire, so a test can send what no client library would."""
+    lines = [f"POST {procedure} HTTP/1.1", "Host: harness"]
+    if length:
+        lines.append(f"Content-Length: {len(body)}")
+    for key, value in headers if headers is not None else [("X-Codefly-Work-Context", WORK_CONTEXT)]:
+        lines.append(f"{key}: {value}")
+    return ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + body
+
+
+@dataclass
 class Answer:
     """What a caller saw of one call."""
 
@@ -137,6 +175,30 @@ class Runnable:
             return Answer(refused.status, refused.read().decode("utf-8"),
                           refused.headers.get("Codefly-Runnable-Failure-Code", ""))
 
+    def exchange(self, raw: bytes, *, timeout: float = 5.0, half_close: bool = False) -> Exchange:
+        """Send raw bytes on one connection and read until the harness closes it or goes quiet.
+
+        ``half_close`` ends the sending side after the bytes, as a peer whose
+        body stops short of its stated length does.
+        """
+        received, closed = b"", False
+        with socket.create_connection((self.host, self.port), timeout) as connection:
+            connection.sendall(raw)
+            if half_close:
+                connection.shutdown(socket.SHUT_WR)
+            try:
+                while True:
+                    chunk = connection.recv(65536)
+                    if not chunk:
+                        closed = True
+                        break
+                    received += chunk
+            except ConnectionResetError:
+                closed = True
+            except TimeoutError:
+                pass
+        return Exchange(received, closed)
+
     def deadline_in(self, seconds: float) -> dict:
         instant = datetime.now(timezone.utc) + timedelta(seconds=seconds)
         return {"Codefly-Runnable-Deadline": instant.isoformat().replace("+00:00", "Z")}
@@ -188,6 +250,7 @@ def runnable(tmp_path):
             "max-input-bytes": 65536,
             "max-output-bytes": 65536,
             "timeout-nanoseconds": 120_000_000_000,
+            "concurrency": 0,
         }
         contract.update(overrides)
         instance = Runnable(tmp_path / f"word-count-{len(served)}", handler, contract)

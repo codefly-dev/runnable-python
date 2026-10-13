@@ -17,6 +17,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
 import signal
 import socket
 import sys
@@ -31,10 +32,11 @@ from .context import Context
 from .contract import CONTRACT_FILE, RECEIPT_ATTRIBUTE, Contract
 from .protocol import (
     ADDRESS_VARIABLE,
+    DEFAULT_CONCURRENCY,
     FAILURE_CODE_HEADER,
     INVOKE_PROCEDURE,
+    IO_TIMEOUT_SECONDS,
     LOOKUP_PROCEDURE,
-    MAX_ENVELOPE_BYTES,
     SHUTDOWN_GRACE_SECONDS,
     Call,
     HandlerFailure,
@@ -43,6 +45,11 @@ from .protocol import (
     read_call,
 )
 from .schema import SchemaError
+
+# A length is ASCII digits and nothing else: int() would also take a sign, an
+# underscore or a digit from another script, and a negative length reads to EOF.
+_LENGTH = re.compile(r"[0-9]+")
+_ADDRESS = re.compile(r"(?:\[(?P<v6>[^\[\]]+)\]|(?P<host>[^\[\]:]+)):(?P<port>[0-9]{1,5})")
 
 
 @dataclass
@@ -54,6 +61,50 @@ class _Answer:
     code: str = ""
     message: str = ""
     failure: HandlerFailure | None = None
+
+
+class _Calls:
+    """The calls running author code: admitted under the declared bound, and drained at a signal.
+
+    Admission and the stop are one decision under one lock, so no call starts
+    after the harness has begun draining and the drain cannot miss one.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._active = 0
+        self._stopping = False
+        self._changed = threading.Condition()
+
+    def admit(self) -> str:
+        """Count a call in, or say why it is refused."""
+        with self._changed:
+            if self._stopping:
+                return "the harness is stopping and takes no new calls"
+            if self._active >= self._limit:
+                return f"{self._limit} calls are already running, the declared concurrency"
+            self._active += 1
+            return ""
+
+    def release(self) -> None:
+        with self._changed:
+            self._active -= 1
+            self._changed.notify_all()
+
+    @property
+    def stopping(self) -> bool:
+        with self._changed:
+            return self._stopping
+
+    def stop(self) -> None:
+        with self._changed:
+            self._stopping = True
+
+    def drain(self, timeout: float) -> int:
+        """Wait for the admitted calls to end; return how many were still running."""
+        with self._changed:
+            self._changed.wait_for(lambda: self._active == 0, timeout)
+            return self._active
 
 
 def main() -> int:
@@ -72,7 +123,8 @@ def main() -> int:
         # needed it: an owner serving no receipt cannot report an effect it did
         # commit, and a caller reads that silence as inconclusive forever.
         receipt_of = _load(contract, root, RECEIPT_ATTRIBUTE) if contract.recovery == "receipt" else None
-        server = _server(address, contract, handle, receipt_of)
+        calls = _Calls(contract.concurrency or DEFAULT_CONCURRENCY)
+        server = _server(address, contract, calls, handle, receipt_of)
     except (OSError, KeyError, ValueError, ProtocolError, AttributeError, ImportError) as err:
         print(f"[codefly] {err}", file=sys.stderr)
         return 1
@@ -83,6 +135,9 @@ def main() -> int:
         if stopping.is_set():
             return
         stopping.set()
+        # From here every new call is refused, including one arriving on a
+        # connection that was already open.
+        calls.stop()
         # shutdown() blocks until the serving loop ends, and a signal handler
         # runs on the thread that is inside it.
         threading.Thread(target=server.shutdown, daemon=True).start()
@@ -92,47 +147,124 @@ def main() -> int:
     try:
         server.serve_forever(poll_interval=0.05)
     finally:
-        # Calls already in flight are given their grace: cutting them off would
-        # turn every one of them into an unproven effect at once, which is what
-        # the rest of this harness spends its code avoiding.
-        watchdog = threading.Timer(SHUTDOWN_GRACE_SECONDS, lambda: os._exit(0))
-        watchdog.daemon = True
-        watchdog.start()
         server.server_close()
-        watchdog.cancel()
+    # Calls already in flight are given their grace: cutting them off would
+    # turn every one of them into an unproven effect at once, which is what the
+    # rest of this harness spends its code avoiding. The harness ends as soon
+    # as the last one has answered; an idle connection holds nothing.
+    remaining = calls.drain(SHUTDOWN_GRACE_SECONDS)
+    if remaining:
+        print(
+            f"[codefly] {remaining} calls were still running when the {SHUTDOWN_GRACE_SECONDS:g}s grace ended; "
+            "their effects are unproven",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
-def _server(address: str, contract: Contract, handle, receipt_of) -> ThreadingHTTPServer:
+class _Server(ThreadingHTTPServer):
+    """One thread per connection, up to a bound, none of them holding the process open."""
+
+    # The drain above is what waits for calls; a thread parked on an idle
+    # connection is not one, and joining it would hold the exit for its timeout.
+    daemon_threads = True
+    block_on_close = False
+
+    def __init__(self, host: str, port: int, handler, connections: int) -> None:
+        self.address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        self._connections = threading.BoundedSemaphore(connections)
+        super().__init__((host, port), handler)
+
+    def process_request(self, request, client_address) -> None:
+        # A connection over the bound is closed unread: no thread is spent on
+        # it, and a call that was never read never ran.
+        if not self._connections.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._connections.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._connections.release()
+
+
+def _server(address: str, contract: Contract, calls: _Calls, handle, receipt_of) -> ThreadingHTTPServer:
     host, port = _listen(address)
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        # Applied to the connection's socket: a peer that stops sending, or
+        # never sends the next request, releases its thread.
+        timeout = IO_TIMEOUT_SECONDS
 
         def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler's spelling
             if self.path == INVOKE_PROCEDURE:
-                self._answer(_invoke(contract, handle, self._call()))
+                serve = lambda call: _invoke(contract, handle, call)  # noqa: E731
             elif self.path == LOOKUP_PROCEDURE and receipt_of is not None:
-                self._answer(_lookup(contract, receipt_of, self._call()))
+                serve = lambda call: _lookup(contract, receipt_of, call)  # noqa: E731
             else:
                 self._answer(_Answer(404, code="unimplemented", message=f"{self.path} is not served"))
+                return
+            refused = calls.admit()
+            if refused:
+                self._answer(_Answer(503, code="unavailable", message=refused))
+                return
+            try:
+                try:
+                    answer = serve(self._call())
+                except Exception as err:  # noqa: BLE001 — a defect in the framing still answers
+                    answer = _Answer(500, code="internal", message=_describe(err))
+                self._answer(answer)
+            finally:
+                calls.release()
 
         def do_GET(self) -> None:  # noqa: N802
             self._answer(_Answer(405, code="unimplemented", message="the operation is called with POST"))
 
-        def _call(self) -> Call | ProtocolError:
-            limit = contract.max_input_bytes + MAX_ENVELOPE_BYTES
-            declared = int(self.headers.get("Content-Length") or 0)
-            if declared > limit:
-                return ProtocolError(
-                    f"input is {declared} bytes, over the declared {contract.max_input_bytes} byte bound"
-                )
+        def _call(self) -> Call | _Answer:
+            """Read exactly one call off the connection, or refuse it.
+
+            The body is read only by a length stated in ASCII digits. Anything
+            else — a missing length, a chunked or otherwise encoded body, a sign —
+            is refused unread, and the refusal closes the connection, so bytes
+            this call did not consume are never read as the next call.
+            """
+            if self.headers.get_all("Transfer-Encoding"):
+                return _Answer(400, code="invalid_argument",
+                               message="a call states its Content-Length; Transfer-Encoding is refused")
+            lengths = self.headers.get_all("Content-Length") or []
+            if not lengths:
+                return _Answer(411, code="invalid_argument", message="a call states its Content-Length")
+            if len(lengths) > 1 or not _LENGTH.fullmatch(lengths[0]):
+                return _Answer(400, code="invalid_argument",
+                               message="Content-Length is not one length in decimal digits")
+            declared = int(lengths[0])
+            if declared > contract.max_input_bytes:
+                return _Answer(400, code="invalid_argument", message=(
+                    f"input is {declared} bytes, over the declared {contract.max_input_bytes} byte bound"))
             try:
-                return read_call(self.headers, self.rfile.read(declared), contract)
+                body = self.rfile.read(declared)
+            except TimeoutError:
+                return _Answer(408, code="deadline_exceeded",
+                               message=f"the body stalled for {IO_TIMEOUT_SECONDS:g}s")
+            if len(body) != declared:
+                return _Answer(400, code="invalid_argument", message="the body ended before its Content-Length")
+            try:
+                return read_call(self.headers, body, contract)
             except ProtocolError as err:
-                return err
+                return _Answer(400, code="invalid_argument", message=str(err))
 
         def _answer(self, answer: _Answer) -> None:
+            # Anything but a success may have left request bytes unread, and a
+            # stopping harness keeps no connection for a call it will refuse.
+            close = answer.status != 200 or calls.stopping
             if answer.failure is not None:
                 # The one place this header is set. A caller reads it before the
                 # status, and without it no status proves anything.
@@ -147,6 +279,9 @@ def _server(address: str, contract: Contract, handle, receipt_of) -> ThreadingHT
                 body = _error(answer.code, answer.message)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            if close:
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self.end_headers()
             self.wfile.write(body)
             if answer.message:
@@ -155,31 +290,28 @@ def _server(address: str, contract: Contract, handle, receipt_of) -> ThreadingHT
         def log_message(self, *_: object) -> None:
             """Diagnostics are what the harness prints deliberately, not a request log."""
 
-    server = ThreadingHTTPServer.__new__(ThreadingHTTPServer)
-    ThreadingHTTPServer.address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
-    ThreadingHTTPServer.__init__(server, (host, port), Handler)
-    # In-flight calls are joined at close; the grace above bounds how long.
-    server.daemon_threads = False
-    server.block_on_close = True
-    return server
+    # Every admitted call holds a connection, and a caller keeps a few idle
+    # ones beside them; beyond that a connection is a thread spent on nothing.
+    return _Server(host, port, Handler, connections=2 * (contract.concurrency or DEFAULT_CONCURRENCY))
 
 
 def _listen(address: str) -> tuple[str, int]:
-    """Split the allocated host:port. An address with no port names no listener."""
-    if address.startswith("["):
-        host, _, port = address.partition("]:")
-        host = host[1:]
-    else:
-        host, _, port = address.rpartition(":")
-    if not port.isdigit():
-        raise ProtocolError(f"{ADDRESS_VARIABLE}={address!r} is not host:port")
-    return host, int(port)
+    """Split the allocated host:port.
+
+    Both halves are required. A missing host would bind every interface, and a
+    port of 0 would let the operating system choose one nobody was told about.
+    """
+    match = _ADDRESS.fullmatch(address)
+    port = int(match["port"]) if match else 0
+    if not match or not 1 <= port <= 65535:
+        raise ProtocolError(f"{ADDRESS_VARIABLE}={address!r} is not host:port with a port from 1 to 65535")
+    return match["v6"] or match["host"], port
 
 
-def _invoke(contract: Contract, handle, call: Call | ProtocolError) -> _Answer:
+def _invoke(contract: Contract, handle, call: Call | _Answer) -> _Answer:
     """Answer one call: validate the payload, run the handler, validate what it returned."""
-    if isinstance(call, ProtocolError):
-        return _Answer(400, code="invalid_argument", message=str(call))
+    if isinstance(call, _Answer):
+        return call
     try:
         contract.input.validate(call.payload, "input")
     except SchemaError as err:
@@ -198,14 +330,14 @@ def _invoke(contract: Contract, handle, call: Call | ProtocolError) -> _Answer:
     return _Answer(200, body=encoded)
 
 
-def _lookup(contract: Contract, receipt_of, call: Call | ProtocolError) -> _Answer:
+def _lookup(contract: Contract, receipt_of, call: Call | _Answer) -> _Answer:
     """Answer a recovery: what did this effect commit?
 
     Absent answers 404 and is never an error — absent is "not yet known", and a
     caller reads it as inconclusive rather than as permission to invoke again.
     """
-    if isinstance(call, ProtocolError):
-        return _Answer(400, code="invalid_argument", message=str(call))
+    if isinstance(call, _Answer):
+        return call
     try:
         contract.input.validate(call.payload, "input")
     except SchemaError as err:

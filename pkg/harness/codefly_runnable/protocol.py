@@ -11,7 +11,8 @@ than as a mistake in a string.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -31,9 +32,27 @@ EFFECT_HEADER = "Codefly-Runnable-Effect-Id"
 DEADLINE_HEADER = "Codefly-Runnable-Deadline"
 FAILURE_CODE_HEADER = "Codefly-Runnable-Failure-Code"
 
-# How much framing is read around the payload bound, so an oversized request is
-# refused without being read whole.
-MAX_ENVELOPE_BYTES = 64 * 1024
+# Core's bounds on the per-call facts (codefly-dev/core
+# proto/codefly/base/v0/runnable_invocation.proto): RunnableInvocationIdentity's
+# work_context and RunnableInvocation's effect_id. A value over them is not one
+# any caller core admits could have sent.
+MAX_WORK_CONTEXT_LENGTH = 8192
+MAX_EFFECT_ID_LENGTH = 128
+
+# The failure-code grammar the durable-work runtime reads the header with. It is
+# narrower than core's RunnableError.code (any 1 to 128 characters), so a code
+# that satisfies it satisfies both, and a code outside it would be read by that
+# caller as no assertion at all while the handler believed it had asserted.
+FAILURE_CODE_PATTERN = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}")
+
+# How long one read or write on a call's connection may stall, and how long an
+# idle kept-alive connection is held. Without it a peer that stops sending holds
+# a thread for as long as it likes.
+IO_TIMEOUT_SECONDS = 10.0
+
+# Simultaneous calls when the declaration's concurrency is 0, the facility
+# default. A call over the bound is refused before the handler runs.
+DEFAULT_CONCURRENCY = 32
 
 # How long a call in flight has to finish after a signal. A handler interrupted
 # mid-effect leaves it unproven, so the process waits rather than making every
@@ -54,8 +73,10 @@ class HandlerFailure(Exception):
     """
 
     def __init__(self, code: str, message: str) -> None:
-        if not isinstance(code, str) or not 1 <= len(code) <= 128:
-            raise ValueError("failure code must contain 1 to 128 characters")
+        # The code becomes a response header, so it is held to a grammar that
+        # cannot carry a line break or a character a header cannot encode.
+        if not isinstance(code, str) or not FAILURE_CODE_PATTERN.fullmatch(code):
+            raise ValueError(f"failure code must match {FAILURE_CODE_PATTERN.pattern}")
         if not isinstance(message, str):
             raise ValueError("failure message must be a string")
         self.code = code
@@ -84,11 +105,12 @@ class InvocationIdentity:
 
     ``work_context`` is the caller's minted capability, carried verbatim. A
     handler forwards it to whatever it calls in turn and never parses or
-    reconstructs it; the harness does neither too.
+    reconstructs it; the harness does neither too. It is kept out of the repr,
+    so a handler logging its context does not log the capability.
     """
 
     effect: str
-    work_context: str
+    work_context: str = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -124,6 +146,22 @@ def decode(raw: bytes) -> Any:
     return json.loads(raw.decode("utf-8"), parse_constant=constant, object_pairs_hook=unique)
 
 
+def header(headers, name: str) -> str:
+    """The one value of a per-call header, or "" when the call carries none.
+
+    A repeated header is refused rather than resolved to its first value: one
+    call naming two identities means two things to two readers. So is a value
+    carrying a control character, which is how an obsolete line fold arrives.
+    """
+    values = headers.get_all(name) or []
+    if len(values) > 1:
+        raise ProtocolError(f"{name} is repeated")
+    value = values[0] if values else ""
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        raise ProtocolError(f"{name} carries a control character")
+    return value
+
+
 def read_call(headers, body: bytes, contract) -> Call:
     """Read the per-call facts and the bounded body of one call.
 
@@ -138,23 +176,28 @@ def read_call(headers, body: bytes, contract) -> Call:
             f"input is {len(body)} bytes, over the declared {contract.max_input_bytes} byte bound"
         )
 
-    work_context = headers.get(WORK_CONTEXT_HEADER, "")
+    work_context = header(headers, WORK_CONTEXT_HEADER)
     if not work_context:
         # A call with no identity is the one thing the contract exists to
         # prevent, so it is refused rather than run under whatever identity this
         # process happens to have.
         raise ProtocolError("the call carries no Work Context")
-    effect = headers.get(EFFECT_HEADER, "")
+    if len(work_context) > MAX_WORK_CONTEXT_LENGTH:
+        raise ProtocolError(f"the Work Context is over core's {MAX_WORK_CONTEXT_LENGTH} character bound")
+    effect = header(headers, EFFECT_HEADER)
+    if len(effect) > MAX_EFFECT_ID_LENGTH:
+        raise ProtocolError(f"the effect identity is over core's {MAX_EFFECT_ID_LENGTH} character bound")
     if contract.recovery == "receipt" and not effect:
         raise ProtocolError("an effect identity is required for receipt recovery")
 
     budget = contract.timeout_seconds
-    raw_deadline = headers.get(DEADLINE_HEADER, "")
+    raw_deadline = header(headers, DEADLINE_HEADER)
     if raw_deadline:
         deadline = _instant(raw_deadline)
-        # Measured from now rather than from an instant the caller stamped, so
-        # an offset between the two clocks neither shortens nor extends the work
-        # the caller asked for beyond what it actually still allows.
+        # The caller's instant read against this harness's clock, so an offset
+        # between the two clocks moves it: a harness clock running ahead
+        # shortens the budget, and one running behind extends it — never past
+        # the declared timeout, which bounds every call.
         budget = (deadline - datetime.now(timezone.utc)).total_seconds()
         if budget <= 0:
             raise ProtocolError("the deadline had passed before the call was read")
@@ -164,6 +207,8 @@ def read_call(headers, body: bytes, contract) -> Call:
         decoded = decode(body)
     except (UnicodeDecodeError, ValueError) as err:
         raise ProtocolError(f"request body is not UTF-8 JSON: {err}") from err
+    except RecursionError as err:
+        raise ProtocolError("request body nests deeper than the decoder reads") from err
     if not isinstance(decoded, dict):
         raise ProtocolError("request body must be one JSON object")
 
@@ -203,4 +248,8 @@ def _instant(raw: str) -> datetime:
         raise ProtocolError(f"{DEADLINE_HEADER} is not an RFC 3339 instant") from err
     if parsed.tzinfo is None:
         raise ProtocolError(f"{DEADLINE_HEADER} carries no offset, so it names no instant")
-    return parsed.astimezone(timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc)
+    except OverflowError as err:
+        # An offset that carries the instant outside the representable range.
+        raise ProtocolError(f"{DEADLINE_HEADER} names no representable instant") from err
