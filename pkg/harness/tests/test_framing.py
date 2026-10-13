@@ -11,6 +11,7 @@ import http.client
 import json
 import signal
 import socket
+import struct
 import subprocess
 import threading
 import time
@@ -44,14 +45,18 @@ TEXT_CONTRACT = {
 # Every call the handler runs is recorded beside it, so a test can prove a call
 # never ran rather than inferring it from an answer.
 RECORDING_HANDLER = """
+import atexit
 import pathlib
 import time
 
 RAN = pathlib.Path(__file__).with_name("ran.log")
+atexit.register(lambda: RAN.with_name("exited").write_text("atexit ran"))
 
 def handle(context, input):
     with RAN.open("a") as ran:
         ran.write(input["text"] + "\\n")
+    if input["text"] == "raise":
+        raise RuntimeError("raised on purpose")
     if input["text"].startswith("slow"):
         time.sleep(float(input["text"][4:] or 2))
     return {"count": 1}
@@ -70,6 +75,11 @@ def ran(unit) -> list[str]:
 
 def body(text: str) -> bytes:
     return json.dumps({"text": text}).encode()
+
+
+def exited_cleanly(unit) -> bool:
+    """Whether the handler module's atexit hook ran when the harness ended."""
+    return (unit.root / "exited").exists()
 
 
 def until(condition, timeout: float = 15.0, what: str = "the condition") -> None:
@@ -563,6 +573,7 @@ def test_a_stopping_harness_ends_once_no_call_is_running(runnable):
 
     assert unit.exit_code(timeout=10) == 0
     assert time.monotonic() - started < 5
+    assert exited_cleanly(unit), "the handler module's atexit hook did not run"
     kept.close()
 
 
@@ -585,6 +596,7 @@ def test_a_call_cut_off_by_the_grace_is_reported_by_the_exit_code(runnable):
 
     assert unit.exit_code(timeout=45) == 1
     assert "unproven" in unit.diagnostics()
+    assert exited_cleanly(unit), "the atexit hook did not run beside a handler cut off by the grace"
     caller.join(10)
     assert isinstance(outcome[0], OSError), "a call cut off at the end of the grace is never answered"
 
@@ -684,11 +696,20 @@ def test_decoding_stays_within_the_read_budget(runnable):
     and a document the schema refuses is dropped before the next. Released
     early or decoded side by side, these took the process to many GiB.
     """
-    unit = recording(runnable, concurrency=200, **{"max-input-bytes": 32 * 1024 * 1024})
+    # Every element is checked before the last refuses the document, so each
+    # decoded document lives as long as it takes to check it: decoded side by
+    # side, they would all be alive together.
+    unit = runnable(
+        RECORDING_HANDLER,
+        input={"fields": [{"name": "items", "type": "array", "items": {"type": "object", "fields": []}}]},
+        output=TEXT_CONTRACT["output"],
+        concurrency=200,
+        **{"max-input-bytes": 32 * 1024 * 1024},
+    ).serve()
     readers = READ_MEMORY_BYTES // (MAX_HEAD_BYTES + 32 * 1024 * 1024)
     assert readers == 7
-    objects = b"[" + b",".join([b"{}"] * ((1024 * 1024 - 40) // 3)) + b"]"
-    whole = request(b'{"text":' + objects + b"}")
+    objects = b"[" + b",".join([b"{}"] * ((1024 * 1024 - 40) // 3)) + b",1]"
+    whole = request(b'{"items":' + objects + b"}")
 
     # Every body arrives but its last byte, then every last byte at once:
     # decoding is what is left, and all of it would happen together.
@@ -817,6 +838,7 @@ def test_a_signal_with_many_connections_open_ends_with_the_documented_code(runna
     unit.process.send_signal(signal.SIGTERM)
 
     assert unit.exit_code(timeout=45) == 0, unit.diagnostics()[-300:]
+    assert exited_cleanly(unit), "the handler module's atexit hook did not run"
     for connection in parked:
         connection.close()
 
@@ -859,3 +881,129 @@ def test_an_input_over_the_read_budget_is_refused(runnable):
     assert exchange.status == 413
     assert exchange.responses == 1 and exchange.closed
     assert ran(unit) == []
+
+
+def test_a_graceful_stop_runs_the_handler_modules_exit_hooks_and_flushes_its_buffers(runnable):
+    """N-c: a stop is an ordinary interpreter exit, so what the handler deferred to exit still happens."""
+    unit = runnable(
+        """
+import atexit
+import pathlib
+
+HERE = pathlib.Path(__file__).parent
+EFFECTS = (HERE / "effects.log").open("a")
+atexit.register(lambda: (HERE / "exited").write_text("atexit ran"))
+
+def handle(context, input):
+    EFFECTS.write("effect " + input["text"] + "\\n")
+    return {"count": 1}
+""",
+        **TEXT_CONTRACT,
+    ).serve()
+
+    assert unit.call({"text": "one"}).status == 200
+    unit.process.send_signal(signal.SIGTERM)
+
+    assert unit.exit_code(timeout=45) == 0
+    assert exited_cleanly(unit), "the handler module's atexit hook did not run"
+    assert (unit.root / "effects.log").read_text() == "effect one\n", "a buffered write was lost at exit"
+
+
+@pytest.mark.parametrize("variant", ["changes after the first read", "raises when read"])
+def test_a_failure_code_is_read_once_and_that_value_is_sent(runnable, variant):
+    """N-b: the value checked is the value sent; a code that cannot be read asserts nothing."""
+    unit = runnable(
+        """
+from codefly_runnable import HandlerFailure
+
+class Changing(HandlerFailure):
+    reads = 0
+
+    @property
+    def code(self):
+        Changing.reads += 1
+        return "card_declined" if Changing.reads == 1 else "x\\r\\nInjected: yes"
+
+class Raising(HandlerFailure):
+    @property
+    def code(self):
+        raise RuntimeError("no code")
+
+def handle(context, input):
+    raise (Changing if input["text"] == "changing" else Raising)("card_declined", "declined")
+""",
+        **TEXT_CONTRACT,
+    ).serve()
+
+    exchange = unit.exchange(request(body("changing" if variant == "changes after the first read" else "raising")))
+
+    assert not exchange.has_header("Injected")
+    if variant == "changes after the first read":
+        assert exchange.status == 422
+        assert exchange.header("Codefly-Runnable-Failure-Code") == "card_declined"
+    else:
+        assert exchange.status == 500
+        assert not exchange.has_header("Codefly-Runnable-Failure-Code")
+
+
+def _fill_stderr(unit) -> None:
+    """Leave the harness's stderr pipe full: the test never reads it until the process has ended."""
+    for _ in range(6):
+        assert unit.exchange(request(b"", procedure="/" + "a" * 30000), timeout=1).status == 404
+
+
+def test_an_unread_stderr_never_holds_a_call_slot(runnable):
+    """A diagnostic written while a call holds its slot would, on an unread stderr, hold it forever."""
+    unit = recording(runnable, concurrency=1)
+    _fill_stderr(unit)
+
+    failed = unit.call({"text": "raise"}, timeout=10)
+    after = unit.call({"text": "after"}, timeout=10)
+
+    assert failed.status == 500
+    assert after.status == 200, "the failed call's diagnostic kept its slot"
+    assert ran(unit) == ["raise", "after"]
+
+
+def test_an_unread_stderr_cannot_hold_the_exit_past_the_grace(runnable):
+    """The diagnostic naming handlers cut off by the grace is written without waiting on the stream."""
+    unit = recording(runnable)
+    caller = threading.Thread(target=lambda: _ignore(lambda: unit.call({"text": "slow60"}, timeout=60)), daemon=True)
+    caller.start()
+    until(lambda: ran(unit) == ["slow60"], what="the call starting")
+    _fill_stderr(unit)
+
+    unit.process.send_signal(signal.SIGTERM)
+
+    assert unit.exit_code(timeout=45) == 1
+
+
+def test_a_connection_failing_beside_an_unread_stderr_cannot_turn_the_exit_into_a_crash(runnable):
+    """A caller resetting its connection before the answer makes the write raise.
+
+    The stdlib reports that with a traceback on stderr; on an unread stderr
+    the reporting thread would block holding the stream's lock, and
+    interpreter shutdown would abort on it. The harness reports it as a
+    diagnostic instead, which never touches the stream.
+    """
+    unit = recording(runnable)
+    _fill_stderr(unit)
+    resetting = socket.create_connection((unit.host, unit.port))
+    resetting.sendall(request(body("slow1")))
+    until(lambda: ran(unit) == ["slow1"], what="the call starting")
+    resetting.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    resetting.close()
+    # The handler returns, its answer meets the reset, and the call is over.
+    until(lambda: unit.call({"text": "after"}, timeout=5).status == 200, what="the next call")
+
+    unit.process.send_signal(signal.SIGTERM)
+
+    assert unit.exit_code(timeout=45) == 0
+    assert exited_cleanly(unit)
+
+
+def _ignore(action) -> None:
+    try:
+        action()
+    except OSError:
+        pass

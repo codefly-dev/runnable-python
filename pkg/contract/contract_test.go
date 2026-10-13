@@ -100,8 +100,9 @@ func TestTheFailureCodeHeaderIsSetInOnePlace(t *testing.T) {
 	if occurrences := strings.Count(runner, "FAILURE_CODE_HEADER"); occurrences != 2 {
 		t.Fatalf("the failure-code header is named %d times: once in the import and once where it is set", occurrences)
 	}
-	if !strings.Contains(runner, "self.send_header(FAILURE_CODE_HEADER, answer.failure.code)") {
-		t.Error("the failure-code header no longer carries the handler's own declared code")
+	if !strings.Contains(runner, "self.send_header(FAILURE_CODE_HEADER, code)") ||
+		strings.Count(runner, "code = _code_of(answer.failure)") != 1 {
+		t.Error("the failure-code header no longer carries the handler's own declared code, read once and checked")
 	}
 }
 

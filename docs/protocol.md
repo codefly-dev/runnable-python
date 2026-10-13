@@ -94,6 +94,15 @@ budget the process holds one document being decoded and, under each running
 call's slot, a payload its contract admits — the envelope the declaration's
 `max-input-bytes` and `concurrency` state.
 
+Decoding one call at a time is first come, first served, so a small call can
+wait behind every decode queued ahead of it. The wait is bounded: admission comes
+before the queue, so at most min(concurrency, readers) calls are ahead, each one
+decode and check of at most `max-input-bytes`. A 1 MiB body whose last element
+is the one the schema refuses takes about 0.2 s, so at concurrency 32 a call
+waits at most about six seconds behind a full queue. A review measured the
+median of small calls rising from 0.58 s to 1.69 s against 24 peers looping such
+bodies, every call still answered `200`.
+
 **Concurrency is not yet one number.** Core's declaration says `0` means the
 facility default and defines none, so the harness admits 32 when the declaration
 is silent. The durable-work runtime decides how many calls it dispatches from
@@ -156,9 +165,11 @@ The code becomes a response header, so it must match
 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$` — the grammar the durable-work runtime reads
 it with, which is narrower than core's 1 to 128 characters. A code outside it
 raises `ValueError` where it is constructed, and the handler's call then answers
-as any untyped error does: unproven. The code is read-only, and checked again
-where the header is set: a code changed after construction answers `500` with
-no failure code.
+as any untyped error does: unproven. The code is read-only, and where the
+header is set it is read exactly once, checked, and that same value is sent: a
+code changed after construction — even by a subclass whose `code` property
+returns something else on a later read — answers `500` with no failure code, and
+so does a code that raises when read.
 
 Everything else leaves the effect **unproven**, because the harness cannot know
 which side of its effect a handler stopped on. A caller that read a bare status
@@ -200,15 +211,26 @@ already open, which answer `503` with `Connection: close` — and gives the call
 in flight `SHUTDOWN_GRACE_SECONDS` (30 s) to finish — including a handler whose
 call was already answered at its deadline. Cutting them off would turn every one
 of them into an unproven effect at once. The harness exits `0` as soon as the
-last handler has returned; an idle connection holds nothing. The process ends
-with that code directly rather than through interpreter shutdown, which can
-abort while connection threads are still parked or writing a diagnostic. If the grace ends
-with handlers still running, they are cut off and the harness exits `1`, saying
-how many effects it left unproven.
+last handler has returned; an idle connection holds nothing. It is an ordinary
+interpreter exit: the handler module's `atexit` hooks run and its buffered
+writes are flushed, so a `logging` handler, a telemetry exporter or a client
+that flushes at exit still does. If the grace ends with handlers still running,
+they are cut off and the harness exits `1`, saying how many effects it left
+unproven. That exit cannot wait for interpreter shutdown beside author code
+that is still running and may hold any lock, so the `atexit` hooks run and the
+standard streams are flushed for at most `CLOSE_SECONDS` (2 s), and the process
+then ends with `1` directly; a buffered write the handler never flushed and no
+hook flushes is lost there.
 
 `stdout` and `stderr` carry diagnostics only, never completion data: a handler
 that printed its output would be indistinguishable from a library that printed a
-warning. The harness does **not** bound them. Per-call stream bounding is not
+warning. The harness's own diagnostics never wait on the stream: they queue for
+one writer that writes the descriptor directly, so a placement that does not
+read stderr cannot stall a call that holds its slot, and no harness thread holds
+the stream's lock when the process exits. Past 1,024 queued diagnostics a new
+one is dropped and counted, and the count is written at exit if the stream then accepts it. A handler's own
+`print` and `context.log` write the stream as any code does, and wait on it as
+any code does. The harness does **not** bound the streams. Per-call stream bounding is not
 something a server can do — concurrent calls share the process's descriptors —
 and `max_log_bytes` describes what the placement capturing those streams
 enforces, which is where it belongs.

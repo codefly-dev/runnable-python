@@ -80,6 +80,10 @@ IDLE_CONNECTIONS = 64
 # number, not one any placement resolved; see docs/protocol.md.
 HARNESS_CONCURRENCY = 32
 
+# How long the harness gives its own connection threads to end, and its
+# diagnostics to be written, once the calls in flight have finished.
+CLOSE_SECONDS = 2.0
+
 # How long a call in flight has to finish after a signal. A handler interrupted
 # mid-effect leaves it unproven, so the process waits rather than making every
 # call in flight unproven at once.

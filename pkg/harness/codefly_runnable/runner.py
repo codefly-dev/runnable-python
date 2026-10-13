@@ -14,10 +14,12 @@ believed otherwise would stop looking for a receipt that exists.
 
 from __future__ import annotations
 
+import atexit
 import importlib
 import io
 import json
 import os
+import queue
 import re
 import signal
 import socket
@@ -34,6 +36,7 @@ from .context import Context
 from .contract import CONTRACT_FILE, RECEIPT_ATTRIBUTE, Contract
 from .protocol import (
     ADDRESS_VARIABLE,
+    CLOSE_SECONDS,
     FAILURE_CODE_HEADER,
     FAILURE_CODE_PATTERN,
     HARNESS_CONCURRENCY,
@@ -142,6 +145,58 @@ class _Calls:
             return self._active
 
 
+class _Diagnostics:
+    """The harness's own diagnostics, written so that nothing waits on stderr.
+
+    A placement that never reads the stream would otherwise stall whichever
+    thread printed — and a request thread printing holds its call's slot, so
+    every later call would be refused. Messages queue for one writer, which
+    writes the descriptor directly and so holds no stream lock that a thread
+    or interpreter shutdown could wait on. Past the queue's bound a message is
+    dropped and counted rather than waited for.
+    """
+
+    def __init__(self, capacity: int = 1024) -> None:
+        self._queue: queue.Queue[str] = queue.Queue(capacity)
+        self._dropped = 0
+        self._lock = threading.Lock()
+        self._closing = threading.Event()
+        self._writer = threading.Thread(target=self._write, name="codefly-diagnostics", daemon=True)
+        self._writer.start()
+
+    def say(self, message: str) -> None:
+        try:
+            self._queue.put_nowait(message)
+        except queue.Full:
+            with self._lock:
+                self._dropped += 1
+
+    def _write(self) -> None:
+        while not (self._closing.is_set() and self._queue.empty()):
+            try:
+                message = self._queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            data = f"[codefly] {message}\n".encode("utf-8", "backslashreplace")
+            try:
+                while data:
+                    data = data[os.write(2, data):]
+            except OSError:
+                pass
+
+    def close(self, timeout: float) -> None:
+        """Write what is queued, for at most this long."""
+        with self._lock:
+            dropped, self._dropped = self._dropped, 0
+        if dropped:
+            self.say(f"{dropped} diagnostics were dropped while stderr was not being read")
+        self._closing.set()
+        self._writer.join(timeout)
+
+
+_DIAGNOSTICS = _Diagnostics()
+
+
 def main() -> int:
     """Serve this runnable until it is signalled. The return value is the exit code."""
     root = Path(__file__).resolve().parent.parent
@@ -161,7 +216,8 @@ def main() -> int:
         calls = _Calls(contract.concurrency or HARNESS_CONCURRENCY)
         server = _server(address, contract, calls, handle, receipt_of)
     except (OSError, KeyError, ValueError, ProtocolError, AttributeError, ImportError) as err:
-        print(f"[codefly] {err}", file=sys.stderr)
+        _DIAGNOSTICS.say(str(err))
+        _DIAGNOSTICS.close(CLOSE_SECONDS)
         return 1
 
     stopping = threading.Event()
@@ -190,26 +246,38 @@ def main() -> int:
     # the last one has returned; an idle connection holds nothing.
     remaining = calls.drain(SHUTDOWN_GRACE_SECONDS)
     if remaining:
-        print(
-            f"[codefly] {remaining} handlers were still running when the {SHUTDOWN_GRACE_SECONDS:g}s grace ended; "
-            "their effects are unproven",
-            file=sys.stderr,
+        _DIAGNOSTICS.say(
+            f"{remaining} handlers were still running when the {SHUTDOWN_GRACE_SECONDS:g}s grace ended; "
+            "their effects are unproven"
         )
-    _exit(1 if remaining else 0)
-    return 1 if remaining else 0
+    # No thread the harness started holds a stream lock — its diagnostics are
+    # written to the descriptor directly — so interpreter shutdown cannot
+    # abort on one, and the process exits normally: the handler module's
+    # atexit hooks run and its buffers are flushed.
+    _DIAGNOSTICS.close(CLOSE_SECONDS)
+    code = 1 if remaining else 0
+    if remaining:
+        _exit_now(code)
+    return code
 
 
-def _exit(code: int) -> None:
-    """End the process with this code, whatever its connection threads are doing.
+def _exit_now(code: int) -> None:
+    """End the process with this code while threads the harness cannot stop are still running.
 
-    Interpreter finalization with daemon threads still parked on connections —
-    or holding the lock of a stream they are writing a diagnostic to — can
-    abort instead of exiting, and a placement would read a crash where the code
-    says what happened to the calls. Streams get a bounded moment to flush.
+    A handler past the grace is author code, and it may hold any lock —
+    including a stream's — so interpreter shutdown beside it could abort, and a
+    placement would read a crash where the code says what happened to the
+    calls. The handler module's atexit hooks still run and the standard
+    streams are flushed, for at most CLOSE_SECONDS, before the process ends.
     """
-    flushing = threading.Thread(target=lambda: (sys.stdout.flush(), sys.stderr.flush()), daemon=True)
-    flushing.start()
-    flushing.join(2.0)
+    def finish() -> None:
+        atexit._run_exitfuncs()
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+    finishing = threading.Thread(target=finish, daemon=True)
+    finishing.start()
+    finishing.join(CLOSE_SECONDS)
     os._exit(code)
 
 
@@ -286,6 +354,10 @@ class _Server(ThreadingHTTPServer):
     def process_request(self, request, client_address) -> None:
         self.register(request)
         super().process_request(request, client_address)
+
+    def handle_error(self, request, client_address) -> None:
+        """An exception a connection thread did not answer: a diagnostic, not a traceback on stderr."""
+        _DIAGNOSTICS.say(f"a connection ended on {_describe(sys.exc_info()[1])}")
 
     def register(self, request) -> None:
         """Count a new connection in, idle, closing the one idle the longest if it is at the bound."""
@@ -520,7 +592,8 @@ def _server(address: str, contract: Contract, calls: _Calls, handle, receipt_of)
         def _answer(self, answer: _Answer) -> None:
             # Anything but a success may have left request bytes unread, and a
             # stopping harness keeps no connection for a call it will refuse.
-            if answer.failure is not None and not _asserts(answer.failure):
+            code = _code_of(answer.failure) if answer.failure is not None else None
+            if answer.failure is not None and code is None:
                 # Checked again where it is sent: a code changed after it was
                 # constructed asserts nothing, and never reaches a header.
                 answer = _Answer(500, code="internal", message="the handler's failure code changed after it was checked")
@@ -530,7 +603,7 @@ def _server(address: str, contract: Contract, calls: _Calls, handle, receipt_of)
                 # The one place this header is set. A caller reads it before the
                 # status, and without it no status proves anything.
                 self.send_response(answer.status)
-                self.send_header(FAILURE_CODE_HEADER, answer.failure.code)
+                self.send_header(FAILURE_CODE_HEADER, code)
                 body = _error("failed_precondition", str(answer.failure))
             elif answer.status == 200:
                 self.send_response(200)
@@ -548,7 +621,7 @@ def _server(address: str, contract: Contract, calls: _Calls, handle, receipt_of)
             self.end_headers()
             self.wfile.write(body)
             if answer.message:
-                print(f"[codefly] {answer.message}", file=sys.stderr)
+                _DIAGNOSTICS.say(answer.message)
 
         def log_request(self, *_: object) -> None:
             """No request log: an answer's diagnostics are printed by _answer."""
@@ -559,9 +632,17 @@ def _server(address: str, contract: Contract, calls: _Calls, handle, receipt_of)
     return _Server(host, port, Handler, readers=readers, connections=readers + calls.limit + IDLE_CONNECTIONS)
 
 
-def _asserts(failure: HandlerFailure) -> bool:
-    """Whether a failure's code is still one the grammar admits."""
-    return isinstance(failure.code, str) and FAILURE_CODE_PATTERN.fullmatch(failure.code) is not None
+def _code_of(failure: HandlerFailure) -> str | None:
+    """The failure's code, read once, or None when it is no longer one the grammar admits.
+
+    Read once because the value checked must be the value sent: a code that
+    could change between the two reads would reach the header unchecked.
+    """
+    try:
+        code = failure.code
+    except Exception:  # noqa: BLE001 — a code that cannot be read asserts nothing
+        return None
+    return code if isinstance(code, str) and FAILURE_CODE_PATTERN.fullmatch(code) else None
 
 
 def _listen(address: str) -> tuple[str, int]:
