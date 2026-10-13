@@ -40,8 +40,9 @@ type Generated struct {
 	// a call carrying no deadline header is bounded by the author's own
 	// statement of how long the operation may run.
 	TimeoutNanoseconds int64 `json:"timeout-nanoseconds"`
-	// Concurrency is the declared bound on simultaneous calls, which the
-	// harness enforces before a handler runs; 0 is the facility default.
+	// Concurrency is the declared bound on handlers running at once, which the
+	// harness enforces before a handler runs. Core leaves 0 to the facility;
+	// the harness then applies its own bound (see docs/protocol.md).
 	Concurrency uint32 `json:"concurrency"`
 }
 

@@ -23,7 +23,16 @@ from conftest import RUNNABLE, WORK_CONTEXT, request
 
 from codefly_runnable import runner
 from codefly_runnable.contract import Contract
-from codefly_runnable.protocol import IO_TIMEOUT_SECONDS, HandlerFailure, InvocationIdentity, RunnableIdentity
+from codefly_runnable.protocol import (
+    IDLE_CONNECTIONS,
+    IDLE_SECONDS,
+    MAX_HEAD_BYTES,
+    READ_MEMORY_BYTES,
+    REQUEST_READ_SECONDS,
+    HandlerFailure,
+    InvocationIdentity,
+    RunnableIdentity,
+)
 from codefly_runnable.schema import Schema
 
 TEXT_CONTRACT = {
@@ -62,6 +71,23 @@ def body(text: str) -> bytes:
     return json.dumps({"text": text}).encode()
 
 
+def until(condition, timeout: float = 15.0, what: str = "the condition") -> None:
+    """Wait for a condition the harness makes observable, never for a guessed interval."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"{what} did not happen within {timeout:g}s")
+        time.sleep(0.02)
+
+
+def refused_to_connect(unit) -> bool:
+    try:
+        socket.create_connection((unit.host, unit.port), 0.5).close()
+    except OSError:
+        return True
+    return False
+
+
 def recording(runnable, **overrides):
     return runnable(RECORDING_HANDLER, **TEXT_CONTRACT, **overrides).serve()
 
@@ -89,6 +115,10 @@ def test_a_well_formed_connection_carries_one_call_after_another(runnable):
         ("chunked", [("Transfer-Encoding", "chunked")], b"d\r\n" + body("x") + b"\r\n0\r\n\r\n", 400),
         ("absent", [], b"", 411),
         ("over the bound", [("Content-Length", str(65536 + 64 * 1024 + 1))], b"", 400),
+        ("malformed line hiding an encoding",
+         [("Content-Length", "13"), ("X-Bad ", "y"), ("Transfer-Encoding", "chunked")], body("x"), 400),
+        ("malformed line hiding a second Work Context",
+         [("Content-Length", "13"), ("X-Bad ", "y"), ("X-Codefly-Work-Context", "second")], body("x"), 400),
     ],
 )
 def test_a_body_is_read_only_by_one_decimal_length(runnable, case, headers, sent, status):
@@ -108,6 +138,31 @@ def test_a_body_is_read_only_by_one_decimal_length(runnable, case, headers, sent
     assert exchange.header("Connection") == "close"
     assert not exchange.has_header("Codefly-Runnable-Failure-Code")
     assert ran(unit) == [], f"{case}: a refused request reached the handler"
+
+
+@pytest.mark.parametrize("case", ["unserved path", "GET with a body", "over the concurrency"])
+def test_an_answer_given_before_the_body_is_read_closes_the_connection(runnable, case):
+    """D7: the answers given before the body is read are exactly the smuggling shape."""
+    unit = recording(runnable, concurrency=1)
+    sent = body("x")
+    if case == "unserved path":
+        first = request(sent, procedure="/codefly.runnable.v0.Runnable/Nope")
+        status = 404
+    elif case == "GET with a body":
+        first = request(sent).replace(b"POST ", b"GET ", 1)
+        status = 405
+    else:
+        holder = threading.Thread(target=lambda: unit.call({"text": "slow3"}), daemon=True)
+        holder.start()
+        until(lambda: ran(unit) == ["slow3"], what="the holding call starting")
+        first = request(sent)
+        status = 503
+
+    exchange = unit.exchange(first + SMUGGLED)
+
+    assert exchange.status == status, case
+    assert exchange.responses == 1 and exchange.closed, case
+    assert "SMUGGLED" not in ran(unit), case
 
 
 def test_every_error_answer_closes_the_connection(runnable):
@@ -137,20 +192,86 @@ def test_a_body_ending_short_of_its_length_never_runs(runnable):
     assert ran(unit) == []
 
 
-def test_a_stalled_body_is_refused_after_the_io_timeout(runnable):
-    """F6: a peer that stops sending releases its thread instead of holding it forever."""
+def trickle(unit, head: bytes, every: float, stop: threading.Event, count: int = -1) -> socket.socket:
+    """A peer sending its request a byte at a time, each byte well inside any per-read timeout."""
+    connection = socket.create_connection((unit.host, unit.port))
+    connection.sendall(head)
+
+    def drip() -> None:
+        sent = 0
+        while sent != count and not stop.wait(every):
+            sent += 1
+            try:
+                connection.sendall(b" ")
+            except OSError:
+                return
+
+    threading.Thread(target=drip, daemon=True).start()
+    return connection
+
+
+def answered_within(connection: socket.socket, seconds: float) -> bytes:
+    connection.settimeout(seconds)
+    received = b""
+    try:
+        while chunk := connection.recv(65536):
+            received += chunk
+    except ConnectionResetError:
+        pass
+    return received
+
+
+def test_a_trickled_body_is_cut_at_the_request_deadline(runnable):
+    """D2: the deadline is on the request, not on each read, so a byte a second cannot hold it.
+
+    The peer falls silent a second before the deadline: a read that waited a
+    whole per-read timeout from there would answer long after it.
+    """
     unit = recording(runnable)
+    stop = threading.Event()
     started = time.monotonic()
+    connection = trickle(unit, request(b"", [("X-Codefly-Work-Context", WORK_CONTEXT), ("Content-Length", "200")],
+                                       length=False), 1.0, stop, count=int(REQUEST_READ_SECONDS) - 1)
 
-    exchange = unit.exchange(
-        request(b"", [("X-Codefly-Work-Context", WORK_CONTEXT), ("Content-Length", "100")], length=False) + b'{"te',
-        timeout=IO_TIMEOUT_SECONDS + 10,
-    )
+    received = answered_within(connection, REQUEST_READ_SECONDS + 5)
+    stop.set()
 
-    assert exchange.status == 408
-    assert exchange.closed
-    assert time.monotonic() - started < IO_TIMEOUT_SECONDS + 5
+    assert received.startswith(b"HTTP/1.1 408"), received[:60]
+    assert time.monotonic() - started < REQUEST_READ_SECONDS + 3
     assert ran(unit) == []
+
+
+def test_a_trickled_request_line_is_cut_at_the_request_deadline(runnable):
+    unit = recording(runnable)
+    stop = threading.Event()
+    started = time.monotonic()
+    connection = trickle(unit, b"POST /codefly", 1.0, stop)
+
+    answered_within(connection, REQUEST_READ_SECONDS + 5)
+    stop.set()
+
+    assert time.monotonic() - started < REQUEST_READ_SECONDS + 3, "the connection outlived the request deadline"
+
+
+def test_a_request_still_arriving_holds_no_call_slot(runnable):
+    """D2: two trickling peers used to take every slot of a concurrency of 2 and refuse every caller."""
+    unit = recording(runnable, concurrency=1)
+    stop = threading.Event()
+    head = request(b"", [("X-Codefly-Work-Context", WORK_CONTEXT), ("Content-Length", "200")], length=False) + b"{"
+    trickling = [trickle(unit, head, 3.0, stop) for _ in range(2)]
+    # Settling only makes the mutation it guards against more likely to show:
+    # the call below succeeds however long the trickling requests take to arrive.
+    time.sleep(0.5)
+
+    started = time.monotonic()
+    answer = unit.call({"text": "legitimate"})
+    stop.set()
+    for connection in trickling:
+        connection.close()
+
+    assert answer.status == 200
+    assert time.monotonic() - started < REQUEST_READ_SECONDS / 2
+    assert ran(unit) == ["legitimate"]
 
 
 def test_calls_over_the_declared_concurrency_are_refused(runnable):
@@ -160,7 +281,7 @@ def test_calls_over_the_declared_concurrency_are_refused(runnable):
     first = []
     caller = threading.Thread(target=lambda: first.append(unit.call({"text": "slow1.5"})))
     caller.start()
-    time.sleep(0.5)
+    until(lambda: ran(unit) == ["slow1.5"], what="the first call starting")
     over = unit.call({"text": "over"})
     caller.join(30)
 
@@ -170,20 +291,66 @@ def test_calls_over_the_declared_concurrency_are_refused(runnable):
     assert ran(unit) == ["slow1.5"]
 
 
-def test_connections_over_the_bound_are_closed_unread(runnable):
-    """F6: a connection is a thread, so they are bounded too — twice the declared concurrency."""
+def test_a_handler_past_its_deadline_keeps_its_slot_until_it_returns(runnable):
+    """D3: the bound is on author code running, not on calls answered."""
     unit = recording(runnable, concurrency=1)
-    held = [socket.create_connection((unit.host, unit.port)) for _ in range(2)]
-    time.sleep(0.3)
 
-    over = unit.exchange(request(body("over")), timeout=3)
+    late = unit.call({"text": "slow4"}, headers=unit.deadline_in(0.5))
+    over = unit.call({"text": "over"})
 
-    assert over.responses == 0 and over.closed
+    assert late.status == 504
+    assert over.status == 503, "a second handler ran beside one still running"
+    assert not over.proven_no_effect
+    until(lambda: unit.call({"text": "after"}).status == 200, what="the slot freeing once the handler returned")
+    assert ran(unit) == ["slow4", "after"]
+
+
+BIG_INPUT = {"max-input-bytes": 64 * 1024 * 1024}
+
+
+def test_requests_being_read_are_bounded_by_memory(runnable):
+    """D2 and D5: a request over the readers' memory is refused before any of it is read."""
+    unit = recording(runnable, concurrency=1, **BIG_INPUT)
+    readers = READ_MEMORY_BYTES // (MAX_HEAD_BYTES + BIG_INPUT["max-input-bytes"])
+    assert readers == 3
+    held = [socket.create_connection((unit.host, unit.port)) for _ in range(readers)]
+    for connection in held:
+        connection.sendall(b"POST /codefly")
+
+    def refused() -> bool:
+        return unit.exchange(b"GET / HTTP/1.1\r\nHost: harness\r\n\r\n", timeout=2).received.startswith(
+            b"HTTP/1.1 503")
+
+    until(refused, what="a request over the readers' bound being refused")
     for connection in held:
         connection.close()
-    time.sleep(0.3)
-    assert unit.call({"text": "after"}).status == 200
+    until(lambda: unit.call({"text": "after"}).status == 200, what="the readers freeing")
     assert ran(unit) == ["after"]
+
+
+def test_a_running_call_holds_no_reader(runnable):
+    """Once its body has arrived a call is no longer being read, so readers do not bound running calls."""
+    unit = recording(runnable, concurrency=4, **BIG_INPUT)
+    running = [threading.Thread(target=lambda: unit.call({"text": "slow3"}), daemon=True) for _ in range(3)]
+    for caller in running:
+        caller.start()
+    until(lambda: ran(unit) == ["slow3"] * 3, what="three calls running")
+
+    assert unit.call({"text": "fourth"}).status == 200
+
+
+def test_an_idle_connection_makes_room_for_a_new_one(runnable):
+    """D2: at the connection bound the idle connection goes, not the caller who needs one."""
+    unit = recording(runnable, concurrency=1, **BIG_INPUT)
+    bound = 3 + 1 + IDLE_CONNECTIONS
+    held = [socket.create_connection((unit.host, unit.port)) for _ in range(bound)]
+
+    answer = unit.call({"text": "newcomer"})
+
+    assert answer.status == 200
+    assert answered_within(held[0], 5) == b"", "the oldest idle connection was not the one closed"
+    for connection in held:
+        connection.close()
 
 
 def test_a_negative_concurrency_refuses_to_start(runnable):
@@ -201,6 +368,14 @@ def test_a_failure_code_outside_the_grammar_is_refused(code):
     """F4: the code becomes a header, so it cannot carry a line break or a character a header cannot encode."""
     with pytest.raises(ValueError, match="failure code must match"):
         HandlerFailure(code, "message")
+
+
+def test_a_failure_code_cannot_change_after_it_was_checked():
+    failure = HandlerFailure("card_declined", "message")
+
+    with pytest.raises(AttributeError):
+        failure.code = "x\r\nInjected: yes"
+    assert failure.code == "card_declined"
 
 
 @pytest.mark.parametrize("code", ["card_declined", "a" * 64, "A.b-9", "0"])
@@ -270,6 +445,56 @@ def test_the_bounds_on_per_call_headers_are_core_bounds_not_less(runnable):
     assert exchange.status == 200
 
 
+@pytest.mark.parametrize("case", ["headers", "request line"])
+def test_the_request_head_is_bounded(runnable, case):
+    """D5: the stdlib alone admits 100 header lines of 64 KiB, about 6 MiB per connection."""
+    unit = recording(runnable)
+    if case == "headers":
+        first = request(body("x"), [("X-Codefly-Work-Context", WORK_CONTEXT)]
+                        + [(f"X-Pad-{index}", "a" * 8000) for index in range(5)])
+    else:
+        first = request(body("x"), procedure="/" + "a" * (MAX_HEAD_BYTES + 1))
+
+    exchange = unit.exchange(first + SMUGGLED)
+
+    assert exchange.status == 431, case
+    assert exchange.responses == 1 and exchange.closed
+    assert ran(unit) == []
+
+
+def test_expect_continue_is_answered_with_the_refusal(runnable):
+    """A peer asking leave to send its body is not invited to upload one that will not be read."""
+    unit = recording(runnable)
+
+    refused = unit.exchange(request(b"", [("X-Codefly-Work-Context", WORK_CONTEXT), ("Expect", "100-continue"),
+                                          ("Content-Length", str(10 * 1024 * 1024))], length=False))
+
+    assert refused.status == 400
+    assert b"100 Continue" not in refused.received
+    assert refused.closed
+
+    with socket.create_connection((unit.host, unit.port), 5) as connection:
+        sent = body("continued")
+        connection.sendall(request(b"", [("X-Codefly-Work-Context", WORK_CONTEXT), ("Expect", "100-continue"),
+                                         ("Content-Length", str(len(sent)))], length=False))
+        assert connection.recv(1024).startswith(b"HTTP/1.1 100")
+        connection.sendall(sent)
+        assert connection.recv(1024).startswith(b"HTTP/1.1 200")
+    assert ran(unit) == ["continued"]
+
+
+def test_a_kept_connection_advertises_how_long_it_is_kept(runnable):
+    """D6: a client that reads Keep-Alive retires the connection before the harness closes it."""
+    unit = recording(runnable)
+
+    kept = unit.exchange(request(body("a")), timeout=1)
+    refused = unit.exchange(request(b'{"text": 3}'))
+
+    assert kept.header("Keep-Alive") == f"timeout={IDLE_SECONDS:g}"
+    assert not kept.closed
+    assert refused.header("Connection") == "close" and not refused.has_header("Keep-Alive")
+
+
 def test_a_document_nested_past_the_decoder_is_refused(runnable):
     """F7: a refusal with an answer, never a dropped connection."""
     unit = recording(runnable)
@@ -308,9 +533,9 @@ def test_a_stopping_harness_refuses_calls_on_connections_already_open(runnable):
     in_flight = []
     caller = threading.Thread(target=lambda: in_flight.append(unit.call({"text": "slow2"})))
     caller.start()
-    time.sleep(0.5)
+    until(lambda: "slow2" in ran(unit), what="the call in flight starting")
     unit.process.send_signal(signal.SIGTERM)
-    time.sleep(0.3)
+    until(lambda: refused_to_connect(unit), what="the harness stopping")
 
     kept.request("POST", "/codefly.runnable.v0.Runnable/Invoke", body=body("after"), headers=headers)
     refused = kept.getresponse()
@@ -353,7 +578,7 @@ def test_a_call_cut_off_by_the_grace_is_reported_by_the_exit_code(runnable):
 
     caller = threading.Thread(target=call, daemon=True)
     caller.start()
-    time.sleep(0.5)
+    until(lambda: ran(unit) == ["slow60"], what="the call starting")
 
     unit.process.send_signal(signal.SIGTERM)
 

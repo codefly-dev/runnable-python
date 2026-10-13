@@ -45,14 +45,40 @@ MAX_EFFECT_ID_LENGTH = 128
 # caller as no assertion at all while the handler believed it had asserted.
 FAILURE_CODE_PATTERN = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}")
 
-# How long one read or write on a call's connection may stall, and how long an
-# idle kept-alive connection is held. Without it a peer that stops sending holds
-# a thread for as long as it likes.
-IO_TIMEOUT_SECONDS = 10.0
+# How long reading one request may take, its head and its body together. It is
+# one wall-clock deadline rather than a bound on each read, which a peer sending
+# a byte just inside it would hold open forever.
+REQUEST_READ_SECONDS = 10.0
 
-# Simultaneous calls when the declaration's concurrency is 0, the facility
-# default. A call over the bound is refused before the handler runs.
-DEFAULT_CONCURRENCY = 32
+# How long one write of an answer may stall before the connection is dropped.
+WRITE_STALL_SECONDS = 10.0
+
+# How long a kept-alive connection may sit idle between calls. It is longer than
+# the idle timeout of the pool the durable-work runtime calls through (Go's
+# net/http, 90 s by default), so the caller retires an idle connection before
+# the harness closes it: a call written onto a connection the harness had just
+# closed would come back as a reset, an uncertain outcome for a call that never
+# ran. Answers advertise it in a Keep-Alive header for clients that read one.
+IDLE_SECONDS = 120.0
+
+# The request line and every header together. The per-call facts need under
+# 9 KiB at core's bounds; the stdlib alone would admit 100 lines of 64 KiB.
+MAX_HEAD_BYTES = 32 * 1024
+
+# Memory for requests being read, head and body. It sizes how many requests are
+# read at once: a request over that count is refused before anything of it is
+# read, and a call holds no slot while its request is still arriving.
+READ_MEMORY_BYTES = 256 * 1024 * 1024
+MAX_READERS = 1024
+
+# Idle connections kept beside every request being read and every call
+# running. Past them, a new connection closes the one idle the longest.
+IDLE_CONNECTIONS = 64
+
+# The harness's own bound on simultaneous calls when the declaration states
+# none (concurrency 0, which core leaves to the facility). It is this harness's
+# number, not one any placement resolved; see docs/protocol.md.
+HARNESS_CONCURRENCY = 32
 
 # How long a call in flight has to finish after a signal. A handler interrupted
 # mid-effect leaves it unproven, so the process waits rather than making every
@@ -79,8 +105,13 @@ class HandlerFailure(Exception):
             raise ValueError(f"failure code must match {FAILURE_CODE_PATTERN.pattern}")
         if not isinstance(message, str):
             raise ValueError("failure message must be a string")
-        self.code = code
+        self._code = code
         super().__init__(message)
+
+    @property
+    def code(self) -> str:
+        """The validated code. Read-only: what was checked is what is sent."""
+        return self._code
 
 
 @dataclass(frozen=True)

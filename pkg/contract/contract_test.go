@@ -3,6 +3,8 @@ package contract_test
 import (
 	"fmt"
 	"io/fs"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -77,8 +79,12 @@ func TestTheHeaderBoundsAreCoresBounds(t *testing.T) {
 		if limit == 0 {
 			t.Fatalf("core declares no max_len on %s", field.FullName())
 		}
-		if declaration := fmt.Sprintf("%s = %d", bound.literal, limit); !strings.Contains(protocol, declaration) {
-			t.Errorf("the harness does not declare %s, core's bound on %s", declaration, field.FullName())
+		declared := regexp.MustCompile(`(?m)^`+bound.literal+` = ([0-9]+)$`).FindAllStringSubmatch(protocol, -1)
+		if len(declared) != 1 {
+			t.Fatalf("the harness declares %s %d times, not once", bound.literal, len(declared))
+		}
+		if value, err := strconv.ParseUint(declared[0][1], 10, 64); err != nil || value != limit {
+			t.Errorf("the harness declares %s = %s; core bounds %s at %d", bound.literal, declared[0][1], field.FullName(), limit)
 		}
 	}
 }

@@ -48,19 +48,58 @@ owner's body would be a field the owner never described.
 
 The body is read only by a `Content-Length` written in ASCII digits, at most
 `max-input-bytes`. A missing length is refused `411`; a `Transfer-Encoding`, a
-repeated length, a sign or any other spelling is refused `400`, unread; a body
-that ends short of its length is refused `400`. **Every answer but a `200`
+repeated length, a sign or any other spelling is refused `400`, unread; so is a
+request carrying a header line the parser could not read, which would otherwise
+end the parsed headers early and hide every header after it. A body that ends
+short of its length is refused `400`. A request asking `Expect: 100-continue` is
+told the refusal instead of being invited to upload. **Every answer but a `200`
 closes the connection** (`Connection: close`), so bytes a refused call did not
 consume are never read as the next call — under whatever Work Context those
 bytes name.
 
-The harness bounds what a peer can hold. A read or write that stalls for
-`IO_TIMEOUT_SECONDS` (10 s) ends the connection, answering `408` when it was a
-body that stalled; the same timeout releases an idle kept-alive connection.
-Simultaneous calls are bounded by the declaration's `concurrency`
-(`DEFAULT_CONCURRENCY`, 32, when it declares 0, the facility default); a call
-over the bound is refused `503` before the handler runs. Open connections are
-bounded at twice that, and one over it is closed unread.
+### What a peer can hold
+
+Every bound below is in `codefly_runnable/protocol.py`, and each is the harness's
+own: none is a value a placement resolved.
+
+| Bound | Value | At the bound |
+| --- | --- | --- |
+| reading one request, head and body together (`REQUEST_READ_SECONDS`) | 10 s wall clock, from its first byte | `408` once the body has begun; a head that has not arrived is dropped unanswered |
+| the request line and headers (`MAX_HEAD_BYTES`) | 32 KiB | `431` |
+| requests being read at once (`READ_MEMORY_BYTES` ÷ (32 KiB + `max-input-bytes`), at most 1,024) | 256 MiB of heads and bodies: 248 readers at the default 1 MiB input | `503`, before any of the request is read |
+| calls whose handler is running (the declared `concurrency`) | `HARNESS_CONCURRENCY`, 32, when the declaration states 0 | `503` |
+| open connections (readers + concurrency + `IDLE_CONNECTIONS`, 64) | — | the connection idle the longest is closed to make room; a new one is never refused |
+| an idle kept-alive connection (`IDLE_SECONDS`) | 120 s, advertised as `Keep-Alive: timeout=120` | closed |
+| one write of an answer (`WRITE_STALL_SECONDS`) | 10 s | the connection is dropped |
+
+The read deadline is one instant per request, not a bound on each read: a peer
+sending a byte every few seconds is cut when the request's time is up, however
+regularly it sends. A call takes its concurrency slot only once its whole
+request has arrived, so a request still arriving holds no slot, and a slow peer
+costs a reader — bounded by memory, released at the deadline — rather than a
+call. A slot is held until the handler really returns, not until the call is
+answered: a call answered `504` at its deadline keeps its slot while its handler
+runs on, so the declared concurrency bounds author code running.
+
+**Concurrency is not yet one number.** Core's declaration says `0` means the
+facility default and defines none, so the harness admits 32 when the declaration
+is silent. The durable-work runtime decides how many calls it dispatches from
+its own installation material (1 to 200), not from the declaration. When the
+runtime dispatches more than the harness admits, each excess call answers `503`:
+an unproven outcome the caller recovers by its recovery policy. Until the
+placement passes the number it resolved, declare `concurrency` and install with
+the same number. A declaration of `0` is not refused: core's own scaffold
+declares no concurrency, so refusing it would refuse every scaffolded runnable.
+
+The idle timeout is longer than the idle timeout of the pool the durable-work
+runtime calls through (Go's `net/http`, 90 s by default), so the caller retires
+an idle connection before the harness closes it. The other order makes a call
+written onto a connection the harness had just closed come back as a reset — an
+unproven outcome for a call that never ran. A proxy pooling connections to the
+harness needs an idle timeout under 120 s for the same reason; Envoy's default
+of one hour is not. Under the connection bound, the harness closing an idle
+connection to make room has the same cost, which is why that bound sits beside
+every reader and every running call rather than in place of them.
 
 | Route | Answers |
 | --- | --- |
@@ -117,8 +156,8 @@ as proof would stop looking for a receipt that exists.
 | raised anything else | `500`, no failure code | unproven |
 | was still running at the deadline | `504`, no failure code | unproven |
 | returned an answer the contract refuses | `500`, no failure code | unproven |
-| was never reached (payload, identity, effect id, framing) | `400`/`408`/`411`, no failure code | unproven |
-| was never reached (over the concurrency, or stopping) | `503`, no failure code | unproven |
+| was never reached (payload, identity, effect id, framing) | `400`/`408`/`411`/`431`, no failure code | unproven |
+| was never reached (over a bound, or stopping) | `503`, no failure code | unproven |
 
 The statuses are for humans and proxies: core classifies on the failure-code
 header and the answer document, never on a status class.
@@ -136,17 +175,19 @@ representable instant, is refused before the handler runs.
 
 The handler runs on its own thread, because Python cannot raise into one. When
 the budget passes the harness answers and the handler is still running; what it
-would have returned is no longer that call's outcome.
+would have returned is no longer that call's outcome. It keeps its concurrency
+slot until it returns.
 
 ## Signals and logs
 
 A signal stops the harness taking new calls — on new connections and on ones
 already open, which answer `503` with `Connection: close` — and gives the calls
-in flight `SHUTDOWN_GRACE_SECONDS` (30 s) to finish. Cutting them off would turn
-every one of them into an unproven effect at once. The harness exits `0` as
-soon as the last call in flight has answered; an idle connection holds nothing.
-If the grace ends with calls still running, they are cut off unanswered and the
-harness exits `1`, saying how many effects it left unproven.
+in flight `SHUTDOWN_GRACE_SECONDS` (30 s) to finish — including a handler whose
+call was already answered at its deadline. Cutting them off would turn every one
+of them into an unproven effect at once. The harness exits `0` as soon as the
+last handler has returned; an idle connection holds nothing. If the grace ends
+with handlers still running, they are cut off and the harness exits `1`, saying
+how many effects it left unproven.
 
 `stdout` and `stderr` carry diagnostics only, never completion data: a handler
 that printed its output would be indistinguishable from a library that printed a
