@@ -67,8 +67,10 @@ own: none is a value a placement resolved.
 | reading one request, head and body together (`REQUEST_READ_SECONDS`) | 10 s wall clock, from its first byte | `408` once the body has begun; a head that has not arrived is dropped unanswered |
 | the request line and headers (`MAX_HEAD_BYTES`) | 32 KiB | `431` |
 | requests being read at once (`READ_MEMORY_BYTES` ÷ (32 KiB + `max-input-bytes`), at most 1,024) | 256 MiB of heads and bodies: 248 readers at the default 1 MiB input | `503`, before any of the request is read |
+| one request's body, whatever the declaration (`READ_MEMORY_BYTES` − 32 KiB) | just under 256 MiB | `413`: a declared `max-input-bytes` larger than the whole read budget is held to the budget |
+| documents being decoded | one at a time | waits its turn, still holding its reader |
 | calls whose handler is running (the declared `concurrency`) | `HARNESS_CONCURRENCY`, 32, when the declaration states 0 | `503` |
-| open connections (readers + concurrency + `IDLE_CONNECTIONS`, 64) | — | the connection idle the longest is closed to make room; a new one is never refused |
+| open connections (readers + concurrency + `IDLE_CONNECTIONS`, 64) | — | the connection idle the longest is closed to make room; a new one is never refused, and a request that begins on a connection in the instant it is closed is refused unread rather than run with nowhere to answer |
 | an idle kept-alive connection (`IDLE_SECONDS`) | 120 s, advertised as `Keep-Alive: timeout=120` | closed |
 | one write of an answer (`WRITE_STALL_SECONDS`) | 10 s | the connection is dropped |
 
@@ -80,6 +82,17 @@ costs a reader — bounded by memory, released at the deadline — rather than a
 call. A slot is held until the handler really returns, not until the call is
 answered: a call answered `504` at its deadline keeps its slot while its handler
 runs on, so the declared concurrency bounds author code running.
+
+A request keeps its reader until its body has been decoded and checked against
+the input schema: a decoded document can be many times the bytes it came from —
+an array of empty objects is about twenty — so the readers' bound is a bound on
+decoding only while decoding sits inside it. The order is: read the body, take a
+concurrency slot (or answer `503` without decoding anything), decode and check
+the payload one call at a time, release the reader, run the handler. A payload
+the schema refuses is dropped before the next is decoded, so beyond the read
+budget the process holds one document being decoded and, under each running
+call's slot, a payload its contract admits — the envelope the declaration's
+`max-input-bytes` and `concurrency` state.
 
 **Concurrency is not yet one number.** Core's declaration says `0` means the
 facility default and defines none, so the harness admits 32 when the declaration
@@ -143,7 +156,9 @@ The code becomes a response header, so it must match
 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$` — the grammar the durable-work runtime reads
 it with, which is narrower than core's 1 to 128 characters. A code outside it
 raises `ValueError` where it is constructed, and the handler's call then answers
-as any untyped error does: unproven.
+as any untyped error does: unproven. The code is read-only, and checked again
+where the header is set: a code changed after construction answers `500` with
+no failure code.
 
 Everything else leaves the effect **unproven**, because the harness cannot know
 which side of its effect a handler stopped on. A caller that read a bare status
@@ -156,7 +171,7 @@ as proof would stop looking for a receipt that exists.
 | raised anything else | `500`, no failure code | unproven |
 | was still running at the deadline | `504`, no failure code | unproven |
 | returned an answer the contract refuses | `500`, no failure code | unproven |
-| was never reached (payload, identity, effect id, framing) | `400`/`408`/`411`/`431`, no failure code | unproven |
+| was never reached (payload, identity, effect id, framing) | `400`/`408`/`411`/`413`/`431`, no failure code | unproven |
 | was never reached (over a bound, or stopping) | `503`, no failure code | unproven |
 
 The statuses are for humans and proxies: core classifies on the failure-code
@@ -185,7 +200,9 @@ already open, which answer `503` with `Connection: close` — and gives the call
 in flight `SHUTDOWN_GRACE_SECONDS` (30 s) to finish — including a handler whose
 call was already answered at its deadline. Cutting them off would turn every one
 of them into an unproven effect at once. The harness exits `0` as soon as the
-last handler has returned; an idle connection holds nothing. If the grace ends
+last handler has returned; an idle connection holds nothing. The process ends
+with that code directly rather than through interpreter shutdown, which can
+abort while connection threads are still parked or writing a diagnostic. If the grace ends
 with handlers still running, they are cut off and the harness exits `1`, saying
 how many effects it left unproven.
 

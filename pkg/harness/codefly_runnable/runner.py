@@ -35,6 +35,7 @@ from .contract import CONTRACT_FILE, RECEIPT_ATTRIBUTE, Contract
 from .protocol import (
     ADDRESS_VARIABLE,
     FAILURE_CODE_HEADER,
+    FAILURE_CODE_PATTERN,
     HARNESS_CONCURRENCY,
     IDLE_CONNECTIONS,
     IDLE_SECONDS,
@@ -194,8 +195,22 @@ def main() -> int:
             "their effects are unproven",
             file=sys.stderr,
         )
-        return 1
-    return 0
+    _exit(1 if remaining else 0)
+    return 1 if remaining else 0
+
+
+def _exit(code: int) -> None:
+    """End the process with this code, whatever its connection threads are doing.
+
+    Interpreter finalization with daemon threads still parked on connections —
+    or holding the lock of a stream they are writing a diagnostic to — can
+    abort instead of exiting, and a placement would read a crash where the code
+    says what happened to the calls. Streams get a bounded moment to flush.
+    """
+    flushing = threading.Thread(target=lambda: (sys.stdout.flush(), sys.stderr.flush()), daemon=True)
+    flushing.start()
+    flushing.join(2.0)
+    os._exit(code)
 
 
 class _Input(socket.SocketIO):
@@ -269,6 +284,11 @@ class _Server(ThreadingHTTPServer):
         super().__init__((host, port), handler)
 
     def process_request(self, request, client_address) -> None:
+        self.register(request)
+        super().process_request(request, client_address)
+
+    def register(self, request) -> None:
+        """Count a new connection in, idle, closing the one idle the longest if it is at the bound."""
         with self._lock:
             if len(self._open) >= self._connections:
                 oldest = next((connection for connection, idle in self._open.items() if idle), None)
@@ -279,14 +299,26 @@ class _Server(ThreadingHTTPServer):
                     except OSError:
                         pass
             self._open[request] = True
-        super().process_request(request, client_address)
 
-    def idle(self, request, idle: bool) -> None:
-        """Mark a connection idle (moved to the back of the eviction order) or busy."""
+    def idle(self, request) -> None:
+        """Mark a connection idle again, at the back of the eviction order."""
         with self._lock:
             if request in self._open:
                 del self._open[request]
-                self._open[request] = idle
+                self._open[request] = True
+
+    def claim(self, request) -> bool:
+        """Mark a connection busy, unless it was already closed to make room.
+
+        A connection is closed to make room only while it is idle, so a
+        request that began on it in that same instant is refused before it
+        is read, rather than run with no connection to answer on.
+        """
+        with self._lock:
+            if request not in self._open:
+                return False
+            self._open[request] = False
+            return True
 
     def shutdown_request(self, request) -> None:
         with self._lock:
@@ -296,6 +328,11 @@ class _Server(ThreadingHTTPServer):
 
 def _server(address: str, contract: Contract, calls: _Calls, handle, receipt_of) -> ThreadingHTTPServer:
     host, port = _listen(address)
+    decoding = threading.Lock()
+    readers = max(1, min(MAX_READERS, READ_MEMORY_BYTES // (MAX_HEAD_BYTES + contract.max_input_bytes)))
+    # The largest body one reader may hold. A declaration whose input bound is
+    # larger than the whole budget is held to the budget instead.
+    readable = READ_MEMORY_BYTES - MAX_HEAD_BYTES
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -313,7 +350,6 @@ def _server(address: str, contract: Contract, calls: _Calls, handle, receipt_of)
 
         def handle_one_request(self) -> None:
             """Read one request under the harness's bounds, then serve it."""
-            self.server.idle(self.connection, True)
             self._input.deadline = None
             try:
                 begun = self._body.peek(1)
@@ -324,7 +360,9 @@ def _server(address: str, contract: Contract, calls: _Calls, handle, receipt_of)
                 # connection was closed to make room for a new one.
                 self.close_connection = True
                 return
-            self.server.idle(self.connection, False)
+            if not self.server.claim(self.connection):
+                self.close_connection = True
+                return
             self._prepare()
             if not self.server.readers.acquire(blocking=False):
                 # Refused before a byte of it is read, so no peer can make the
@@ -342,6 +380,9 @@ def _server(address: str, contract: Contract, calls: _Calls, handle, receipt_of)
             finally:
                 self.rfile = self._body
                 self._done_reading()
+                # Back of the eviction order: the connection idle the longest
+                # is the one whose last request ended first.
+                self.server.idle(self.connection)
 
         def _prepare(self) -> None:
             """Make an answer possible before a request line was parsed."""
@@ -375,19 +416,29 @@ def _server(address: str, contract: Contract, calls: _Calls, handle, receipt_of)
             if serve is None:
                 self._answer(_Answer(404, code="unimplemented", message=f"{self.path} is not served"))
                 return
-            call = self._call()
-            if isinstance(call, _Answer):
-                self._answer(call)
+            body = self._read()
+            if isinstance(body, _Answer):
+                self._answer(body)
                 return
             # A slot is taken only once the whole request has arrived, so a
-            # request still arriving never holds one.
+            # request still arriving never holds one — and before the body is
+            # decoded, so a call refused for want of one is never decoded.
             slot = calls.admit()
             if isinstance(slot, str):
+                self._done_reading()
                 self._answer(_Answer(503, code="unavailable", message=slot))
                 return
             try:
                 try:
-                    answer = serve(call, slot)
+                    try:
+                        call = self._decode(body)
+                    finally:
+                        # The request stays under the readers' memory bound
+                        # until it is decoded; from here the decoded call is
+                        # held under its concurrency slot instead.
+                        body = None
+                        self._done_reading()
+                    answer = call if isinstance(call, _Answer) else serve(call, slot)
                 except Exception as err:  # noqa: BLE001 — a defect in the framing still answers
                     answer = _Answer(500, code="internal", message=_describe(err))
                 self._answer(answer)
@@ -424,31 +475,55 @@ def _server(address: str, contract: Contract, calls: _Calls, handle, receipt_of)
             if declared > contract.max_input_bytes:
                 return _Answer(400, code="invalid_argument", message=(
                     f"input is {declared} bytes, over the declared {contract.max_input_bytes} byte bound"))
+            if declared > readable:
+                return _Answer(413, code="resource_exhausted", message=(
+                    f"input is {declared} bytes, over the {readable} bytes one request may hold in memory"))
             return declared
 
-        def _call(self) -> Call | _Answer:
-            """Read exactly one call off the connection, or refuse it."""
+        def _read(self) -> bytes | _Answer:
+            """Read exactly one call's body off the connection, or refuse it.
+
+            The request keeps its reader until it has been decoded: the bytes
+            read here count against the readers' memory bound.
+            """
+            declared = self._framing()
+            if isinstance(declared, _Answer):
+                return declared
             try:
-                declared = self._framing()
-                if isinstance(declared, _Answer):
-                    return declared
-                try:
-                    body = self._body.read(declared)
-                except TimeoutError:
-                    return _Answer(408, code="deadline_exceeded",
-                                   message=f"the request was not read within {REQUEST_READ_SECONDS:g}s")
-            finally:
-                self._done_reading()
+                body = self._body.read(declared)
+            except TimeoutError:
+                return _Answer(408, code="deadline_exceeded",
+                               message=f"the request was not read within {REQUEST_READ_SECONDS:g}s")
             if len(body) != declared:
                 return _Answer(400, code="invalid_argument", message="the body ended before its Content-Length")
-            try:
-                return read_call(self.headers, body, contract)
-            except ProtocolError as err:
-                return _Answer(400, code="invalid_argument", message=str(err))
+            return body
+
+        def _decode(self, body: bytes) -> Call | _Answer:
+            """Decode one call and check it against the input schema, one call at a time.
+
+            A decoded document can be many times the bytes it came from — an
+            array of empty objects is about twenty — so concurrent decoding
+            would put memory beyond any bound on what is read. A document the
+            schema refuses is dropped before the next is decoded, so only a
+            call the contract admits outlives this, under its concurrency
+            slot. Decoding and checking are CPU-bound under the interpreter
+            lock, so doing them one call at a time costs no throughput.
+            """
+            with decoding:
+                try:
+                    call = read_call(self.headers, body, contract)
+                    contract.input.validate(call.payload, "input")
+                except (ProtocolError, SchemaError) as err:
+                    return _Answer(400, code="invalid_argument", message=str(err))
+                return call
 
         def _answer(self, answer: _Answer) -> None:
             # Anything but a success may have left request bytes unread, and a
             # stopping harness keeps no connection for a call it will refuse.
+            if answer.failure is not None and not _asserts(answer.failure):
+                # Checked again where it is sent: a code changed after it was
+                # constructed asserts nothing, and never reaches a header.
+                answer = _Answer(500, code="internal", message="the handler's failure code changed after it was checked")
             close = answer.status != 200 or calls.stopping
             self.connection.settimeout(WRITE_STALL_SECONDS)
             if answer.failure is not None:
@@ -481,8 +556,12 @@ def _server(address: str, contract: Contract, calls: _Calls, handle, receipt_of)
         def log_message(self, *_: object) -> None:
             """Diagnostics are what the harness prints deliberately, not a request log."""
 
-    readers = max(1, min(MAX_READERS, READ_MEMORY_BYTES // (MAX_HEAD_BYTES + contract.max_input_bytes)))
     return _Server(host, port, Handler, readers=readers, connections=readers + calls.limit + IDLE_CONNECTIONS)
+
+
+def _asserts(failure: HandlerFailure) -> bool:
+    """Whether a failure's code is still one the grammar admits."""
+    return isinstance(failure.code, str) and FAILURE_CODE_PATTERN.fullmatch(failure.code) is not None
 
 
 def _listen(address: str) -> tuple[str, int]:
@@ -499,12 +578,7 @@ def _listen(address: str) -> tuple[str, int]:
 
 
 def _invoke(contract: Contract, handle, call: Call, slot: _Slot) -> _Answer:
-    """Answer one call: validate the payload, run the handler, validate what it returned."""
-    try:
-        contract.input.validate(call.payload, "input")
-    except SchemaError as err:
-        return _Answer(400, code="invalid_argument", message=str(err))
-
+    """Answer one call whose payload the contract admits: run the handler, validate what it returned."""
     outcome = _run(handle, _context(contract, call), call, slot)
     if outcome.failure is not None or outcome.status != 200:
         return outcome
@@ -519,16 +593,11 @@ def _invoke(contract: Contract, handle, call: Call, slot: _Slot) -> _Answer:
 
 
 def _lookup(contract: Contract, receipt_of, call: Call, slot: _Slot) -> _Answer:
-    """Answer a recovery: what did this effect commit?
+    """Answer a recovery whose payload the contract admits: what did this effect commit?
 
     Absent answers 404 and is never an error — absent is "not yet known", and a
     caller reads it as inconclusive rather than as permission to invoke again.
     """
-    try:
-        contract.input.validate(call.payload, "input")
-    except SchemaError as err:
-        return _Answer(400, code="invalid_argument", message=str(err))
-
     outcome = _run(receipt_of, _context(contract, call), call, slot)
     if outcome.failure is not None or outcome.status != 200:
         return outcome
@@ -565,7 +634,12 @@ def _run(handler: Callable[[Context, dict], Any], context: Context, call: Call, 
 
     worker = threading.Thread(target=invoke, daemon=True)
     slot.hold()
-    worker.start()
+    try:
+        worker.start()
+    except BaseException:
+        # The thread that would have released this hold never ran.
+        slot.release()
+        raise
     worker.join(call.budget)
     if worker.is_alive():
         return _Answer(504, code="deadline_exceeded", message="the deadline passed")

@@ -11,6 +11,7 @@ import http.client
 import json
 import signal
 import socket
+import subprocess
 import threading
 import time
 
@@ -630,3 +631,231 @@ def test_a_defect_in_the_framing_still_answers_and_asserts_nothing():
     assert answered.value.status == 500
     assert "a defect in the framing" in answered.value.read().decode()
     assert answered.value.headers.get("Codefly-Runnable-Failure-Code") is None
+
+
+def rss_mib(pid: int) -> float:
+    """The harness's resident memory, as the operating system reports it."""
+    out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True).stdout
+    return int(out.strip() or 0) / 1024
+
+
+class _Peak:
+    """The harness's peak resident memory over a stretch of a test, sampled every 10 ms."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.baseline = rss_mib(pid)
+        self.peak = self.baseline
+        self._done = threading.Event()
+        self._sampler = threading.Thread(target=self._sample, daemon=True)
+
+    def _sample(self) -> None:
+        while not self._done.wait(0.01):
+            self.peak = max(self.peak, rss_mib(self.pid))
+
+    def __enter__(self) -> "_Peak":
+        self._sampler.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self._done.set()
+        self._sampler.join(5)
+
+    @property
+    def growth(self) -> float:
+        return self.peak - self.baseline
+
+
+def _send(unit, raw: bytes, *, withhold_last: bool = False) -> socket.socket:
+    connection = socket.create_connection((unit.host, unit.port))
+    try:
+        connection.sendall(raw[:-1] if withhold_last else raw)
+    except OSError:
+        # Refused unread once the readers are taken: the harness closed it.
+        pass
+    return connection
+
+
+def test_decoding_stays_within_the_read_budget(runnable):
+    """M1: a decoded document is many times its bytes, so decoding is bounded with the reading.
+
+    Each body is 1 MiB of empty objects, about 24 MiB decoded. A request keeps
+    its reader until it has been decoded, calls are decoded one at a time,
+    and a document the schema refuses is dropped before the next. Released
+    early or decoded side by side, these took the process to many GiB.
+    """
+    unit = recording(runnable, concurrency=200, **{"max-input-bytes": 32 * 1024 * 1024})
+    readers = READ_MEMORY_BYTES // (MAX_HEAD_BYTES + 32 * 1024 * 1024)
+    assert readers == 7
+    objects = b"[" + b",".join([b"{}"] * ((1024 * 1024 - 40) // 3)) + b"]"
+    whole = request(b'{"text":' + objects + b"}")
+
+    # Every body arrives but its last byte, then every last byte at once:
+    # decoding is what is left, and all of it would happen together.
+    with _Peak(unit.process.pid) as together:
+        connections = [_send(unit, whole, withhold_last=True) for _ in range(120)]
+        for connection in connections:
+            try:
+                connection.sendall(whole[-1:])
+            except OSError:
+                pass
+        answers = [answered_within(connection, 20)[:12] for connection in connections]
+    # Whole bodies from eight senders at once: a reader freed before its body
+    # is decoded would let them all be read and wait, in memory, for their turn.
+    sent: list[socket.socket] = []
+
+    def sender() -> None:
+        for _ in range(30):
+            sent.append(_send(unit, whole))
+
+    with _Peak(unit.process.pid) as queued:
+        senders = [threading.Thread(target=sender) for _ in range(8)]
+        for thread in senders:
+            thread.start()
+        for thread in senders:
+            thread.join(60)
+        answers += [answered_within(connection, 20)[:12] for connection in sent]
+    connections += sent
+    for connection in connections:
+        connection.close()
+
+    assert answers.count(b"HTTP/1.1 400") >= 2, "no call was decoded at all"
+    assert set(answers) <= {b"HTTP/1.1 400", b"HTTP/1.1 503", b""}, set(answers)
+    # Seven readers of 1 MiB, one decoded document of about 24 MiB, and the
+    # allocator's slack: well under what 120 bodies read or decoded at once take.
+    for stretch in (together, queued):
+        assert stretch.growth < 100, f"peak {stretch.peak:.0f} MiB over a {stretch.baseline:.0f} MiB baseline"
+    assert ran(unit) == []
+
+
+def test_a_call_refused_for_want_of_a_slot_is_never_decoded(runnable):
+    """M1: admission comes before decoding, so a call over the concurrency costs no decode."""
+    unit = recording(runnable, concurrency=1)
+    holder = threading.Thread(target=lambda: unit.call({"text": "slow3"}), daemon=True)
+    holder.start()
+    until(lambda: ran(unit) == ["slow3"], what="the holding call starting")
+
+    exchange = unit.exchange(request(b"{not json"))
+
+    assert exchange.status == 503, "the body was decoded before admission refused it"
+
+
+def test_a_handler_thread_that_cannot_start_frees_its_slot(runnable):
+    """M2: a slot held for a thread that never ran would refuse every later call, and stall shutdown."""
+    unit = runnable(
+        """
+import threading
+
+_start = threading.Thread.start
+_failures = [2]
+
+def _failing(self):
+    if getattr(self, "_target", None) is not None and self._target.__name__ == "invoke" and _failures[0]:
+        _failures[0] -= 1
+        raise RuntimeError("can't start new thread")
+    return _start(self)
+
+threading.Thread.start = _failing
+
+def handle(context, input):
+    return {"count": 1}
+""",
+        **TEXT_CONTRACT,
+        concurrency=2,
+    ).serve()
+
+    failed = [unit.call({"text": "a"}), unit.call({"text": "b"})]
+    after = unit.call({"text": "c"})
+    started = time.monotonic()
+    unit.process.send_signal(signal.SIGTERM)
+
+    assert [answer.status for answer in failed] == [500, 500]
+    assert not any(answer.proven_no_effect for answer in failed)
+    assert after.status == 200, "a slot stayed held for a handler that never started"
+    assert unit.exit_code(timeout=45) == 0
+    assert time.monotonic() - started < 5, "shutdown waited on a handler that never started"
+
+
+def test_a_failure_code_changed_after_it_was_checked_asserts_nothing(runnable):
+    """N1: the code is checked again where it is sent, so it never reaches a header unchecked."""
+    unit = runnable(
+        """
+from codefly_runnable import HandlerFailure
+
+def handle(context, input):
+    failure = HandlerFailure("card_declined", "declined")
+    failure._code = "x\\r\\nInjected: yes"
+    raise failure
+""",
+        **TEXT_CONTRACT,
+    ).serve()
+
+    exchange = unit.exchange(request(body("a")))
+
+    assert exchange.status == 500
+    assert not exchange.has_header("Codefly-Runnable-Failure-Code")
+    assert not exchange.has_header("Injected")
+
+
+def test_a_signal_with_many_connections_open_ends_with_the_documented_code(runnable):
+    """N2: no call in flight is exit 0, whatever the connection threads are doing.
+
+    The stderr pipe here is never read until the end, so the diagnostics of a
+    few long refusals fill it and leave a connection thread blocked holding
+    the stream's lock — the state in which interpreter finalization aborts.
+    """
+    unit = recording(runnable)
+    parked = []
+    for _ in range(300):
+        connection = socket.create_connection((unit.host, unit.port))
+        connection.sendall(b"POST /codefly.runnable.v0.Runnable/Invoke HTTP/1.1\r\nX-Pad: " + b"a" * 1000)
+        parked.append(connection)
+    for _ in range(6):
+        refused = unit.exchange(request(b"", procedure="/" + "a" * 30000), timeout=1)
+        assert refused.status == 404
+
+    unit.process.send_signal(signal.SIGTERM)
+
+    assert unit.exit_code(timeout=45) == 0, unit.diagnostics()[-300:]
+    for connection in parked:
+        connection.close()
+
+
+def test_a_connection_closed_to_make_room_cannot_begin_a_request():
+    """N3: once a connection is closed to make room, a request that began on it is refused unread."""
+    with socket.socket() as reserved:
+        reserved.bind(("127.0.0.1", 0))
+        port = reserved.getsockname()[1]
+    contract = Contract(
+        handler_module="handler", handler_attribute="handle", input=Schema.parse({}), output=Schema.parse({}),
+        recovery="recompute", max_input_bytes=1024, max_output_bytes=1024, timeout_seconds=5.0,
+        concurrency=1, release=RunnableIdentity(**RUNNABLE),
+    )
+    server = runner._server(f"127.0.0.1:{port}", contract, runner._Calls(1), lambda context, input: {}, None)
+    first, second = socket.socketpair(), socket.socketpair()
+    try:
+        server._connections = 1
+        server.register(first[0])
+        server.register(second[0])
+
+        assert first[1].recv(1) == b"", "the idle connection was not the one closed"
+        assert not server.claim(first[0]), "a request began on a connection already closed to make room"
+        assert server.claim(second[0])
+    finally:
+        server.server_close()
+        for pair in (first, second):
+            for end in pair:
+                end.close()
+
+
+def test_an_input_over_the_read_budget_is_refused(runnable):
+    """N4: a declared bound larger than the whole read budget is held to the budget."""
+    unit = recording(runnable, **{"max-input-bytes": 512 * 1024 * 1024})
+
+    exchange = unit.exchange(
+        request(b"", [("X-Codefly-Work-Context", WORK_CONTEXT), ("Content-Length", str(300 * 1024 * 1024))],
+                length=False) + SMUGGLED)
+
+    assert exchange.status == 413
+    assert exchange.responses == 1 and exchange.closed
+    assert ran(unit) == []
