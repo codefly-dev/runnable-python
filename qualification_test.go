@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -293,7 +294,10 @@ def handle(context: Context, input) -> dict:
 	require.NotEqual(t, basev0.RunnableServedOutcome_SERVED_SUCCEEDED, none.GetOutcome())
 	require.False(t, corerunnable.ServedOutcomeIsCertain(none.GetOutcome()),
 		"a refused call is not the operation asserting anything")
-	require.Contains(t, harness.stderr.String(), "Work Context")
+	// The harness writes its diagnostics from its own thread, after the answer
+	// has gone, so the refusal reaches stderr shortly after it reaches the caller.
+	require.Eventually(t, func() bool { return strings.Contains(harness.stderr.String(), "Work Context") },
+		5*time.Second, 20*time.Millisecond, "the refusal was not explained on stderr:\n%s", harness.stderr.String())
 
 	declined := harness.call(t, corerunnable.ServedInvokeProcedure, map[string]any{"text": "declined"})
 	require.Equal(t, basev0.RunnableServedOutcome_SERVED_OWNER_FAILED, declined.GetOutcome())
@@ -372,8 +376,27 @@ func declare(t *testing.T, ctx context.Context, dir string) *resources.Runnable 
 type served struct {
 	address string
 	process *exec.Cmd
-	stderr  *strings.Builder
+	stderr  *capture
 	pkg     *basev0.RunnablePackage
+}
+
+// capture is a process's stderr as a test reads it while the process is still
+// writing: exec copies into it from a goroutine of its own.
+type capture struct {
+	mu      sync.Mutex
+	written strings.Builder
+}
+
+func (c *capture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.written.Write(p)
+}
+
+func (c *capture) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.written.String()
 }
 
 // serve starts the installed package and waits until it answers. The port is
@@ -386,7 +409,7 @@ func serve(t *testing.T, root string, argv []string, pkg *basev0.RunnablePackage
 	address := listener.Addr().String()
 	require.NoError(t, listener.Close())
 
-	stderr := &strings.Builder{}
+	stderr := &capture{}
 	process := exec.Command(filepath.Join(root, argv[0]), argv[1:]...)
 	process.Dir = root
 	process.Env = append(os.Environ(), corerunnable.ListenAddressEnv+"="+address)
