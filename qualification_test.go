@@ -72,7 +72,7 @@ entrypoint:
 execution:
   facilities: [generated-service, kubernetes]
   timeout: 2m
-  cancellation: signal
+  cancellation: none
   recovery: recompute
   payload:
     max-input-bytes: 65536

@@ -61,6 +61,9 @@ func Generate(runnable *resources.Runnable, dir string) error {
 // Standalone generation checks the declaration's name and version; the Builder
 // always supplies the complete identity resolved during Load.
 func GenerateForRelease(runnable *resources.Runnable, dir string, identity *basev0.RunnableIdentity) error {
+	if err := contract.Supported(runnable); err != nil {
+		return err
+	}
 	module, err := HandlerModule(runnable.Entrypoint.Handler)
 	if err != nil {
 		return err
@@ -205,6 +208,10 @@ def %s(context: Context, input: Input) -> %s | None:
     None is not an error and never means the effect did not happen: it is the
     answer a caller reads as inconclusive, which is what sends it looking again
     rather than invoking a second time.
+
+    Authorize the lookup here: answer only for an effect the caller's
+    context.invocation.work_context may read. The harness requires a Work
+    Context but neither verifies it nor binds the effect id to it.
     """
     raise NotImplementedError("implement the receipt lookup of %s")
 `, contract.ReceiptAttribute, OutputType, runnable.Name)

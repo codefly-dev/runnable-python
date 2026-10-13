@@ -19,6 +19,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/codefly-dev/runnable-python/pkg/contract"
 	"github.com/codefly-dev/runnable-python/pkg/generate"
 	"github.com/codefly-dev/runnable-python/pkg/pack"
 	"github.com/codefly-dev/runnable-python/pkg/prepare"
@@ -87,6 +88,9 @@ func (b *Builder) Load(ctx context.Context, request *builderv0.LoadRequest) (*bu
 		return nil, status.Error(codes.InvalidArgument, "declaration pins a different Runnable agent")
 	}
 	if _, err := generate.HandlerModule(r.Entrypoint.Handler); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if err := contract.Supported(r); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	b.runnable, b.identity = r, proto.Clone(id).(*basev0.RunnableIdentity)

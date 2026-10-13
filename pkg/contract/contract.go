@@ -40,6 +40,24 @@ type Generated struct {
 	// a call carrying no deadline header is bounded by the author's own
 	// statement of how long the operation may run.
 	TimeoutNanoseconds int64 `json:"timeout-nanoseconds"`
+	// Concurrency is the declared bound on simultaneous calls, which the
+	// harness enforces before a handler runs; 0 is the facility default.
+	Concurrency uint32 `json:"concurrency"`
+}
+
+// Supported refuses a declaration the generated harness cannot honour. Both
+// are values core admits, and a package built for either would claim in its
+// configuration what it never does when called.
+func Supported(runnable *resources.Runnable) error {
+	if completion := runnable.Execution.GetCompletion(); completion != resources.RunnableCompletionCall {
+		return fmt.Errorf("completion %q is not served by the Python harness: it answers in the reply to the call (%q) and serves no acceptance, status route or callback",
+			completion, resources.RunnableCompletionCall)
+	}
+	if runnable.Execution.Cancellation == resources.RunnableCancellationSignal {
+		return fmt.Errorf("cancellation %q is not honoured by the Python harness: a handler runs on a thread Python cannot interrupt, so the interrupted outcome it promises could never be reported; declare %q",
+			resources.RunnableCancellationSignal, resources.RunnableCancellationNone)
+	}
+	return nil
 }
 
 // Handler locates the author entrypoint inside the generated package.
@@ -77,6 +95,7 @@ func Generate(runnable *resources.Runnable, handlerModule string) *Generated {
 		MaxInputBytes:      runnable.Execution.MaxInputBytes(),
 		MaxOutputBytes:     runnable.Execution.MaxOutputBytes(),
 		TimeoutNanoseconds: runnable.Execution.GetTimeout().Nanoseconds(),
+		Concurrency:        runnable.Execution.Concurrency,
 		// The whole release identity, not the half a declaration states: the
 		// harness hands it to the handler, and a field missing from the
 		// document is a field the handler cannot read. Standalone generation

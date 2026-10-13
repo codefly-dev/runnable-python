@@ -41,7 +41,7 @@ entrypoint:
 execution:
   facilities: [generated-service]
   timeout: 30s
-  cancellation: signal
+  cancellation: none
   recovery: receipt
 workspace-configuration-dependencies: [stripe]
 `
