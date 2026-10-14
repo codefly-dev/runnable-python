@@ -1,4 +1,4 @@
-"""The bounded schema profile of ``codefly.runnable/v1``.
+"""The bounded schema profile both payloads of a call are held to.
 
 Five value types, ``optional`` (the key may be absent) and ``nullable`` (the
 value may be null) declared separately, and no coercion anywhere: a payload is

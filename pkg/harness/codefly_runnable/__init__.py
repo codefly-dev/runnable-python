@@ -1,8 +1,9 @@
 """The Codefly Python Runnable harness.
 
 A generated runnable is a module with a ``handle(context, input) -> output``
-function; this package validates what reaches it, runs it under the caller's
-deadline and reports one unambiguous outcome.
+function; this package serves it. One call is one POST carrying the bounded
+input document, validated against the contract before the handler sees it and
+validated again on the way out.
 """
 
 from .context import Context

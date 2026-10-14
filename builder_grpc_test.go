@@ -106,7 +106,7 @@ func TestBuilderPackagesThePreparedSnapshotOverGRPC(t *testing.T) {
 	require.NoError(t, err)
 	emitted := response.GetArtifacts()[0]
 	pkg := preparedPackage(t, r, wire.GetIdentity(), prepared.GetBuild(), []*basev0.RunnableArtifact{{
-		Kind: basev0.RunnableArtifact_NATIVE, Platform: runtime.GOOS + "/" + runtime.GOARCH,
+		Kind: basev0.RunnableArtifact_ARCHIVE, Platform: runtime.GOOS + "/" + runtime.GOARCH,
 		Reference: filepath.Base(emitted.GetPath()), Digest: "sha256:" + emitted.GetSha256(), Command: emitted.GetCommand(),
 	}})
 	require.NoError(t, corerunnable.VerifyPackage(pkg))
@@ -116,10 +116,10 @@ func TestBuilderPackagesThePreparedSnapshotOverGRPC(t *testing.T) {
 	require.NotEmpty(t, pkg.GetArtifacts()[0].GetCommand())
 	installed := filepath.Join(root, "installed")
 	unpack(t, response.GetArtifacts()[0].GetPath(), installed)
-	result := invoke(t, installed, pkg.GetArtifacts()[0].GetCommand(), pkg, map[string]any{"text": "one two three"})
-	require.Equal(t, 0, result.exit, result.stderr)
-	require.Equal(t, 3, result.count(t),
-		"the package must execute the prepared handler, so the refused retry discarded no snapshot")
+	harness := serve(t, installed, pkg.GetArtifacts()[0].GetCommand(), pkg)
+	completion := harness.call(t, corerunnable.ServedInvokeProcedure, map[string]any{"text": "one two three"})
+	require.Equal(t, 3, count(t, completion),
+		"the package must serve the prepared handler, so the refused retry discarded no snapshot")
 
 	write(t, filepath.Join(root, "prepared", "runnable", "handler.py"), "def handle(context, input): return {\"count\": 888}\n")
 	_, err = client.Package(ctx, &builderv0.PackageRequest{OutputDirectory: filepath.Join(root, "tampered")})

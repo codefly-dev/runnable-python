@@ -11,11 +11,12 @@ from .protocol import InvocationIdentity, RunnableIdentity
 
 @dataclass(frozen=True)
 class Context:
-    """The invocation a handler is running under.
+    """The call a handler is running under.
 
     The identity is the caller's, not one the handler invents: an effect a
-    handler records under ``effect`` is the same effect the caller will look up
-    when an outcome is uncertain.
+    handler records under ``invocation.effect`` is the same effect the caller
+    looks up when an outcome is uncertain, and ``invocation.work_context`` is
+    the capability it forwards to whatever it calls in turn.
     """
 
     invocation: InvocationIdentity
@@ -28,5 +29,5 @@ class Context:
         return (self.deadline - datetime.now(timezone.utc)).total_seconds()
 
     def log(self, message: str) -> None:
-        """Write a diagnostic. Logs never carry invocation output."""
+        """Write a diagnostic. Logs never carry completion data."""
         print(message, file=sys.stderr)

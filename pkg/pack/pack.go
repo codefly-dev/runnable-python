@@ -68,7 +68,7 @@ func Native(
 		return nil, err
 	}
 	artifact := &basev0.RunnableArtifact{
-		Kind:      basev0.RunnableArtifact_NATIVE,
+		Kind:      basev0.RunnableArtifact_ARCHIVE,
 		Platform:  runtime.GOOS + "/" + runtime.GOARCH,
 		Reference: filepath.Base(archive),
 		Digest:    digest,
@@ -132,9 +132,14 @@ func ConfigurationDigest(runnable *resources.Runnable) (string, error) {
 	}{
 		Configurations: append([]string{}, runnable.WorkspaceConfigurationDependencies...),
 		Execution: map[string]any{
-			"timeout":          runnable.Execution.Timeout,
-			"cancellation":     string(runnable.Execution.Cancellation),
-			"recovery":         string(runnable.Execution.Recovery),
+			"timeout":      runnable.Execution.Timeout,
+			"cancellation": string(runnable.Execution.Cancellation),
+			"recovery":     string(runnable.Execution.Recovery),
+			// How the answer arrives is part of what an invocation is bound to:
+			// two packages differing only in it are called the same way and
+			// answered differently, so a digest that ignored it would call them
+			// the same package.
+			"completion":       string(runnable.Execution.GetCompletion()),
 			"concurrency":      runnable.Execution.Concurrency,
 			"max-input-bytes":  runnable.Execution.MaxInputBytes(),
 			"max-output-bytes": runnable.Execution.MaxOutputBytes(),

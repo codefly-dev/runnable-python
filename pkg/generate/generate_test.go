@@ -23,7 +23,7 @@ agent:
   version: 0.0.2
   publisher: codefly.dev
 contract:
-  protocol: codefly.runnable/v1
+  protocol: codefly.runnable.served/v1
   input:
     fields:
       - name: text
@@ -53,10 +53,11 @@ contract:
 entrypoint:
   handler: handler.py
 execution:
-  facilities: [native]
+  facilities: [generated-service]
   timeout: 1m
   cancellation: none
   recovery: recompute
+  concurrency: 3
   payload:
     max-input-bytes: 4096
     max-output-bytes: 2048
@@ -127,12 +128,42 @@ func TestTheGeneratedContractCarriesTheDeclaredBounds(t *testing.T) {
 	if document["recovery"] != "recompute" {
 		t.Errorf("recovery = %v", document["recovery"])
 	}
+	if document["concurrency"] != 3.0 {
+		t.Errorf("the declared concurrency, which the harness enforces, was not generated: %v", document["concurrency"])
+	}
 	handler, _ := document["handler"].(map[string]any)
 	if handler["module"] != "handler" || handler["attribute"] != "handle" {
 		t.Errorf("handler = %v", handler)
 	}
 	if _, err := os.Stat(filepath.Join(dir, generate.GeneratedDirectory, "codefly_runnable", "runner.py")); err != nil {
 		t.Errorf("the harness was not generated: %v", err)
+	}
+}
+
+// TestGenerationRefusesWhatTheHarnessCannotHonour: core admits both values,
+// and a package generated for either would claim what its harness never does.
+func TestGenerationRefusesWhatTheHarnessCannotHonour(t *testing.T) {
+	for name, change := range map[string][2]string{
+		`completion "submit"`:   {"recovery: recompute", "recovery: receipt\n  completion: submit"},
+		`cancellation "signal"`: {"cancellation: none", "cancellation: signal"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			write(t, filepath.Join(dir, resources.RunnableConfigurationName), strings.Replace(declaration, change[0], change[1], 1))
+			runnable, err := resources.LoadRunnableFromDir(context.Background(), dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			err = generate.Generate(runnable, dir)
+
+			if err == nil || !strings.Contains(err.Error(), name) {
+				t.Fatalf("Generate = %v, want a refusal naming %s", err, name)
+			}
+			if _, err := os.Stat(filepath.Join(dir, generate.GeneratedDirectory)); !os.IsNotExist(err) {
+				t.Errorf("a refused declaration still generated a harness: %v", err)
+			}
+		})
 	}
 }
 

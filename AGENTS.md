@@ -2,11 +2,11 @@
 
 `github.com/codefly-dev/runnable-python` (Go 1.27) is the Codefly Runnable agent
 for Python. It owns everything Python about a runnable: the handler scaffold and
-the typed bindings of a contract, the `codefly.runnable/v1` harness generated
-into every package, uv-locked dependency and interpreter preparation, the native
+the typed bindings of a contract, the `codefly.runnable.served/v1` harness
+served by every package, uv-locked dependency and interpreter preparation, the native
 package and the build evidence identifying it, and the Linux image recipe.
 
-It does **not** own the invocation and result framing, `RunnableLocation`,
+It does **not** own the call framing, `RunnableLocation`,
 `RunnableBuild` or `PackageArtifact.command` — those belong to
 [`codefly-dev/core`](https://github.com/codefly-dev/core), and `pkg/contract`
 here is agent-*private* generated configuration, not wire framing. It does not

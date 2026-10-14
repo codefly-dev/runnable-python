@@ -46,7 +46,7 @@ func (a *Agent) GetAgentInformation(_ context.Context, _ *agentv0.AgentInformati
 		Toolchains: []agentv0.Toolchain_Type{agentv0.Toolchain_PYTHON},
 		Languages:  []agentv0.Language_Type{agentv0.Language_PYTHON},
 		ReadMe: "Codefly Runnable agent for Python: typed handler scaffolding, the " +
-			resources.RunnableProtocolV1 + " harness, uv-locked dependency and interpreter " +
+			resources.RunnableServedProtocolV1 + " harness, uv-locked dependency and interpreter " +
 			"preparation, native packages through Builder gRPC. Runnables pin " +
 			"their interpreter with spec." + prepare.PythonVersionKey + " (default " +
 			prepare.DefaultPythonVersion + ").",
