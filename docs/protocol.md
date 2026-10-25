@@ -257,10 +257,42 @@ present and answering "never".
 
 ## Payload schema
 
-`object`, `array`, `string`, signed 64-bit `integer` and `boolean` are supported.
+`object`, `array`, `string`, signed 64-bit `integer`, `boolean` and `file` are supported.
 `optional` and `nullable` remain distinct. There is no coercion: `3.0` is not an
 integer, `1` is not a boolean, undeclared keys are errors, and a repeated key is
 refused rather than resolved to its last value. Empty schemas accept exactly
 `{}`. Validation errors identify the offending input or output path. Both
 payloads are bounded by the declared `max-input-bytes` / `max-output-bytes`,
 measured on the document that is actually sent.
+
+### Documents
+
+A `file` field is a document, declared with the exact media types its handler
+reads (`media-types: [application/pdf]`). On the wire it is core's
+`runnable.FileValue`: one closed object with `reference`, `media_type`, an
+optional `name` and the `content` in standard padded base64. Any other member —
+a `path`, a `url` — is refused `400` before the handler runs. The caller staged
+the bytes with its own authority; the harness has no network and never
+dereferences the reference.
+
+The handler reads each input file as `codefly_runnable.File` (`media_type`,
+`content` as `bytes`, `reference`, `name`), and the generated types annotate
+the field with that class. A `File` it returns is encoded back and checked: its
+media type must be declared, and its `reference`, when set, must be one of the
+call's input references — the output is then a new version of that document;
+absent, it is a new document. An output naming any other reference answers
+`500`, unproven, like every answer the contract refuses. The caller publishes
+what was returned; a runnable never writes a document in place. The content
+travels inside the payload, so `max-input-bytes` and `max-output-bytes` bound
+the documents one call carries.
+
+## The image recipe
+
+`Builder.Build` emits the Linux image of the prepared snapshot as a
+`DockerBuildPlan`: the Dockerfile and its context assembled in the caller's
+`output_directory` (`RECIPE_CONTEXT_ROOT_OUTPUT`), the image named by the
+caller's `docker_repository` and the release version. The image installs the
+same hashed requirements the native archive was prepared from, runs as UID
+65532 and starts the same harness, so a placement that runs it serves exactly
+what `Package` archived. The agent never runs a container build; the caller
+verifies the plan and builds it.

@@ -130,3 +130,24 @@ func source(t *testing.T, path string) string {
 	}
 	return string(content)
 }
+
+// TestTheFileValueIsCoresFileValue holds the harness's spelling of a file —
+// its members and the bounds on its metadata — to core's runnable.FileValue.
+// A caller staging a document writes core's spelling; a harness reading
+// another would refuse every document it was handed.
+func TestTheFileValueIsCoresFileValue(t *testing.T) {
+	schema := source(t, "codefly_runnable/schema.py")
+	for _, declaration := range []string{
+		fmt.Sprintf("FILE = %q", resources.RunnableFieldFile),
+		fmt.Sprintf("FILE_REFERENCE = %q", corerunnable.FileReferenceMember),
+		fmt.Sprintf("FILE_MEDIA_TYPE = %q", corerunnable.FileMediaTypeMember),
+		fmt.Sprintf("FILE_NAME = %q", corerunnable.FileNameMember),
+		fmt.Sprintf("FILE_CONTENT = %q", corerunnable.FileContentMember),
+		fmt.Sprintf("MAX_FILE_REFERENCE_BYTES = %d", corerunnable.MaxFileReferenceBytes),
+		fmt.Sprintf("MAX_FILE_NAME_BYTES = %d", corerunnable.MaxFileNameBytes),
+	} {
+		if !strings.Contains(schema, declaration) {
+			t.Errorf("the harness does not declare %s", declaration)
+		}
+	}
+}

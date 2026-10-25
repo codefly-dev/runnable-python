@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	"github.com/codefly-dev/core/resources"
+
+	"github.com/codefly-dev/runnable-python/pkg/harness"
 )
 
 // TypesFile is the generated module a handler imports its types from. It is
@@ -16,6 +18,11 @@ const (
 	InputType  = "Input"
 	OutputType = "Output"
 )
+
+// FileType is the harness type a file field is annotated with, imported from
+// the harness package rather than generated: the harness constructs it, so a
+// generated copy would be a second definition the harness never produces.
+const FileType = "File"
 
 // Types renders the typed bindings of a contract. Every object of the bounded
 // profile becomes a TypedDict, so a handler's input and output are checked by
@@ -45,6 +52,11 @@ func Types(runnable *resources.Runnable) []byte {
 	var out strings.Builder
 	out.WriteString("\"\"\"Typed bindings generated from runnable.codefly.yaml. Do not edit.\"\"\"\n\n")
 	fmt.Fprintf(&out, "from typing import %s", imports)
+	if g.files {
+		// A document reaches the handler as the harness's File: the bytes the
+		// caller staged, never a path or a URL.
+		fmt.Fprintf(&out, "\n\nfrom %s import %s", harness.Package, FileType)
+	}
 	for _, class := range classes {
 		out.WriteString("\n\n\n")
 		out.WriteString(class)
@@ -109,6 +121,9 @@ func (g *typeGenerator) annotationOf(field *resources.RunnableField) string {
 		annotation = g.names[field]
 	case resources.RunnableFieldArray:
 		annotation = fmt.Sprintf("list[%s]", g.annotationOf(field.Items))
+	case resources.RunnableFieldFile:
+		annotation = FileType
+		g.files = true
 	}
 	if field.Nullable {
 		annotation += " | None"
@@ -142,6 +157,9 @@ func camel(name string) string {
 type typeGenerator struct {
 	names map[*resources.RunnableField]string
 	used  map[string]bool
+	// files records that a contract carries a document, so the module imports
+	// the harness's File type.
+	files bool
 }
 
 func (g *typeGenerator) allocate(hint string) string {

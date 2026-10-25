@@ -86,6 +86,56 @@ assert get_type_hints(t.Output) == {"count": int}
 	}
 }
 
+// A document field is the harness's File in the handler's types, and the
+// generated contract carries the media types the harness holds it to.
+func TestAFileFieldIsTheHarnessFile(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, resources.RunnableConfigurationName), strings.Replace(declaration,
+		"      - name: text\n        type: string\n",
+		"      - name: text\n        type: string\n      - name: pdf\n        type: file\n        media-types: [application/pdf]\n", 1))
+	runnable, err := resources.LoadRunnableFromDir(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := generate.Generate(runnable, dir); err != nil {
+		t.Fatal(err)
+	}
+	types := string(generate.Types(runnable))
+	if !strings.Contains(types, "from codefly_runnable import File") || !strings.Contains(types, `"pdf": File,`) {
+		t.Fatalf("a file field is not annotated with the harness's File:\n%s", types)
+	}
+	document, err := os.ReadFile(filepath.Join(dir, generate.GeneratedDirectory, generate.ContractFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var generated struct {
+		Input struct {
+			Fields []struct {
+				Name       string   `json:"name"`
+				MediaTypes []string `json:"media-types"`
+			} `json:"fields"`
+		} `json:"input"`
+	}
+	if err := json.Unmarshal(document, &generated); err != nil {
+		t.Fatal(err)
+	}
+	if got := generated.Input.Fields[1]; got.Name != "pdf" || len(got.MediaTypes) != 1 || got.MediaTypes[0] != "application/pdf" {
+		t.Fatalf("the generated contract does not carry the file's media types: %+v", got)
+	}
+	command := exec.Command("uv", "run", "--no-project", "--python", "3.12", "python", "-c", `
+import sys
+sys.path.insert(0, ".codefly")
+from typing import get_type_hints
+import codefly_types as t
+from codefly_runnable import File
+assert get_type_hints(t.Input)["pdf"] is File
+`)
+	command.Dir = dir
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("generated Python types: %v\n%s", err, output)
+	}
+}
+
 func TestAnEmptyContractStillGeneratesBothTypes(t *testing.T) {
 	dir := t.TempDir()
 	write(t, filepath.Join(dir, resources.RunnableConfigurationName),

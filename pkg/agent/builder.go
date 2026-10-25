@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/codefly-dev/core/agents/services"
 	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
 	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
 	"github.com/codefly-dev/core/resources"
@@ -23,6 +24,7 @@ import (
 	"github.com/codefly-dev/runnable-python/pkg/generate"
 	"github.com/codefly-dev/runnable-python/pkg/pack"
 	"github.com/codefly-dev/runnable-python/pkg/prepare"
+	"github.com/codefly-dev/runnable-python/pkg/recipe"
 )
 
 // Builder owns one loaded declaration and its prepared snapshot.
@@ -238,6 +240,65 @@ func (b *Builder) Package(_ context.Context, request *builderv0.PackageRequest) 
 		Artifacts: []*builderv0.PackageArtifact{{Kind: builderv0.PackageArtifact_ARCHIVE, Path: archive,
 			Target: &builderv0.PackageTarget{Os: runtime.GOOS, Architecture: runtime.GOARCH},
 			Sha256: strings.TrimPrefix(artifact.GetDigest(), "sha256:"), MediaType: "application/gzip", Command: artifact.GetCommand()}},
+	}, nil
+}
+
+// Build emits the Linux image recipe of the prepared snapshot: a Dockerfile
+// and the build context it is evaluated against, assembled in the caller's
+// output_directory, described by a DockerBuildPlan the caller verifies and
+// builds. The agent never runs a container build. The image installs the same
+// hashed requirements the native package was prepared from and starts the
+// same harness, so a placement that runs it — an invocation Job, or a local
+// container with no network — serves exactly what Package archived.
+//
+// The image is named by the caller's repository and the release version; the
+// recipe targets the Linux platforms the recipe package supports, and the
+// caller narrows them to its host for an unpushed local build.
+func (b *Builder) Build(_ context.Context, request *builderv0.BuildRequest) (*builderv0.BuildResponse, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.prepared == nil {
+		return nil, status.Error(codes.FailedPrecondition, "prepare the loaded Runnable with RunnableBuildInputs before emitting its image recipe")
+	}
+	repository := request.GetBuildContext().GetDockerBuildContext().GetDockerRepository()
+	if repository == "" || strings.ContainsAny(repository, " :@") {
+		return nil, status.Error(codes.InvalidArgument, "build_context.docker_build_context.docker_repository must name the image repository, without a tag or digest")
+	}
+	root, err := outputDirectory(request.GetOutputDirectory(), b.runnable.Dir())
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if _, err := outputDirectory(root, b.prepared.Root); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if err := requireEmpty(root); err != nil {
+		return nil, err
+	}
+	currentBuild, err := pack.Build(b.runnable, filepath.Join(b.prepared.Root, prepare.SourceDirectory), b.prepared.Toolchain)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "re-measure the prepared snapshot: %v", err)
+	}
+	if !proto.Equal(currentBuild, b.build) {
+		return nil, status.Error(codes.FailedPrecondition, "prepared build inputs changed before the image recipe was emitted")
+	}
+	emitted, err := recipe.Write(b.runnable, b.prepared, root)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "emit the image recipe: %v", err)
+	}
+	plan, err := services.BuildDockerBuildPlan(root, []*builderv0.DockerBuildRecipe{{
+		Name:        "runnable",
+		Dockerfile:  recipe.DockerfileName,
+		Context:     ".",
+		Image:       repository + ":" + b.runnable.Version,
+		Platforms:   emitted.Platforms,
+		ContextRoot: builderv0.RecipeContextRoot_RECIPE_CONTEXT_ROOT_OUTPUT,
+	}})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "describe the image recipe: %v", err)
+	}
+	return &builderv0.BuildResponse{
+		State:  &builderv0.BuildStatus{State: builderv0.BuildStatus_SUCCESS},
+		Result: &builderv0.BuildResult{Version: b.runnable.Version, Kind: &builderv0.BuildResult_DockerBuildPlan{DockerBuildPlan: plan}},
 	}, nil
 }
 

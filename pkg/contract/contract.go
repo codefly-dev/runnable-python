@@ -80,6 +80,9 @@ type Field struct {
 	Nullable bool    `json:"nullable,omitempty"`
 	Fields   []Field `json:"fields,omitempty"`
 	Items    *Field  `json:"items,omitempty"`
+	// MediaTypes are the exact media types a file admits; the harness holds
+	// every file value, in and out, to them.
+	MediaTypes []string `json:"media-types,omitempty"`
 }
 
 // Generate builds the contract document for a runnable declaration. The
@@ -138,10 +141,11 @@ func schemaOf(schema *resources.RunnableSchema) Schema {
 
 func fieldOf(field *resources.RunnableField) Field {
 	out := Field{
-		Name:     field.Name,
-		Type:     string(field.Type),
-		Optional: field.Optional,
-		Nullable: field.Nullable,
+		Name:       field.Name,
+		Type:       string(field.Type),
+		Optional:   field.Optional,
+		Nullable:   field.Nullable,
+		MediaTypes: field.MediaTypes,
 	}
 	for _, nested := range field.Fields {
 		out.Fields = append(out.Fields, fieldOf(nested))

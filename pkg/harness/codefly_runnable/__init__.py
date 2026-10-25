@@ -8,6 +8,6 @@ validated again on the way out.
 
 from .context import Context
 from .protocol import HandlerFailure, InvocationIdentity, RunnableIdentity
-from .schema import Schema, SchemaError
+from .schema import File, Schema, SchemaError
 
-__all__ = ["HandlerFailure", "Context", "InvocationIdentity", "RunnableIdentity", "Schema", "SchemaError"]
+__all__ = ["File", "HandlerFailure", "Context", "InvocationIdentity", "RunnableIdentity", "Schema", "SchemaError"]

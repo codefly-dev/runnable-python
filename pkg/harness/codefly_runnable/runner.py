@@ -659,13 +659,19 @@ def _listen(address: str) -> tuple[str, int]:
 
 
 def _invoke(contract: Contract, handle, call: Call, slot: _Slot) -> _Answer:
-    """Answer one call whose payload the contract admits: run the handler, validate what it returned."""
-    outcome = _run(handle, _context(contract, call), call, slot)
+    """Answer one call whose payload the contract admits: run the handler, validate what it returned.
+
+    Files cross as documents: the handler reads each input file as a File
+    holding its bytes, and a File it returns is encoded back and held to the
+    rule that it is a new document or a new version of an input it was handed.
+    """
+    outcome = _run(handle, _context(contract, call), contract.input.to_handler(call.payload), call, slot)
     if outcome.failure is not None or outcome.status != 200:
         return outcome
     try:
-        contract.output.validate(outcome.output, "output")
-        encoded = encode_output(outcome.output, contract.max_output_bytes)
+        output = contract.output.to_wire(outcome.output)
+        contract.output.validate(output, "output", contract.input.references(call.payload))
+        encoded = encode_output(output, contract.max_output_bytes)
     except (SchemaError, ProtocolError) as err:
         # An answer the contract refuses is not this call's valid response, and
         # the effect may well have committed before the answer was spoiled.
@@ -679,20 +685,21 @@ def _lookup(contract: Contract, receipt_of, call: Call, slot: _Slot) -> _Answer:
     Absent answers 404 and is never an error — absent is "not yet known", and a
     caller reads it as inconclusive rather than as permission to invoke again.
     """
-    outcome = _run(receipt_of, _context(contract, call), call, slot)
+    outcome = _run(receipt_of, _context(contract, call), contract.input.to_handler(call.payload), call, slot)
     if outcome.failure is not None or outcome.status != 200:
         return outcome
     if outcome.output is None:
         return _Answer(404, code="not_found", message="no receipt for this effect")
     try:
-        contract.output.validate(outcome.output, "output")
-        encoded = encode_output(outcome.output, contract.max_output_bytes)
+        output = contract.output.to_wire(outcome.output)
+        contract.output.validate(output, "output", contract.input.references(call.payload))
+        encoded = encode_output(output, contract.max_output_bytes)
     except (SchemaError, ProtocolError) as err:
         return _Answer(500, code="internal", message="receipt: " + str(err))
     return _Answer(200, body=encoded)
 
 
-def _run(handler: Callable[[Context, dict], Any], context: Context, call: Call, slot: _Slot) -> _Answer:
+def _run(handler: Callable[[Context, dict], Any], context: Context, payload: dict, call: Call, slot: _Slot) -> _Answer:
     """Run the handler under the caller's budget.
 
     It runs on its own thread because Python cannot raise into one: when the
@@ -705,7 +712,7 @@ def _run(handler: Callable[[Context, dict], Any], context: Context, call: Call, 
 
     def invoke() -> None:
         try:
-            produced["output"] = handler(context, call.payload)
+            produced["output"] = handler(context, payload)
         except HandlerFailure as failure:
             produced["failure"] = failure
         except BaseException as err:  # noqa: BLE001 — an untyped error asserts nothing

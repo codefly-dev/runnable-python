@@ -1,10 +1,10 @@
 module github.com/codefly-dev/runnable-python
 
-go 1.27.2
+go 1.27.3
 
 require (
 	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.12-20260825204119-511051f7f437.2
-	github.com/codefly-dev/core v0.19.4
+	github.com/codefly-dev/core v0.19.7-0.20261025183912-f462b6a08245
 	github.com/stretchr/testify v1.12.1
 	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.12

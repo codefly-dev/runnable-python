@@ -393,3 +393,41 @@ def handle(context, input):
 
     assert answer.document() == {"count": 1}
     assert "diagnostic" not in answer.body
+
+
+FILE_CONTRACT = {
+    "input": {"fields": [{"name": "doc", "type": "file", "media-types": ["text/plain"]}]},
+    "output": {"fields": [
+        {"name": "words", "type": "integer"},
+        {"name": "upper", "type": "file", "media-types": ["text/plain"]},
+    ]},
+}
+
+FILE_HANDLER = """
+from codefly_runnable import File
+
+def handle(context, input):
+    doc = input["doc"]
+    assert isinstance(doc.content, bytes)
+    upper = File(media_type="text/plain", content=doc.content.upper(), reference=doc.reference)
+    return {"words": len(doc.content.split()), "upper": upper}
+"""
+
+
+def test_a_document_crosses_as_bytes_and_comes_back_as_a_new_version(runnable):
+    import base64
+
+    unit = runnable(FILE_HANDLER, **FILE_CONTRACT).serve()
+    content = base64.b64encode(b"one two three").decode("ascii")
+
+    answer = unit.call({"doc": {"reference": "store://t/entry/e1@v1", "media_type": "text/plain", "content": content}})
+
+    assert answer.status == 200, answer.body
+    document = answer.document()
+    assert document["words"] == 3
+    assert document["upper"]["reference"] == "store://t/entry/e1@v1"
+    assert base64.b64decode(document["upper"]["content"]) == b"ONE TWO THREE"
+
+    refused = unit.call({"doc": {"reference": "store://t/entry/e1@v1", "media_type": "text/plain", "content": content, "path": "/etc/passwd"}})
+    assert refused.status == 400
+    assert "never a path" in refused.body

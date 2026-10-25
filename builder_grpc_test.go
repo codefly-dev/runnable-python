@@ -12,6 +12,7 @@ import (
 
 	"github.com/codefly-dev/core/agents/contract"
 	"github.com/codefly-dev/core/agents/manager"
+	"github.com/codefly-dev/core/agents/services"
 	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
 	agentv0 "github.com/codefly-dev/core/generated/go/codefly/services/agent/v0"
 	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
@@ -120,6 +121,26 @@ func TestBuilderPackagesThePreparedSnapshotOverGRPC(t *testing.T) {
 	completion := harness.call(t, corerunnable.ServedInvokeProcedure, map[string]any{"text": "one two three"})
 	require.Equal(t, 3, count(t, completion),
 		"the package must serve the prepared handler, so the refused retry discarded no snapshot")
+
+	// The same snapshot's Linux image recipe, over Build: a plan the caller
+	// verifies and builds, with its context assembled in the output directory.
+	_, err = client.Build(ctx, &builderv0.BuildRequest{OutputDirectory: filepath.Join(root, "unnamed")})
+	require.Equal(t, codes.InvalidArgument, status.Code(err), "an image needs the caller's repository")
+	recipeRoot := filepath.Join(root, "image")
+	built, err := client.Build(ctx, &builderv0.BuildRequest{
+		OutputDirectory: recipeRoot,
+		BuildContext: &builderv0.BuildContext{Kind: &builderv0.BuildContext_DockerBuildContext{
+			DockerBuildContext: &builderv0.DockerBuildContext{DockerRepository: "codefly.local/proof/word-count"}}},
+	})
+	require.NoError(t, err)
+	plan := built.GetResult().GetDockerBuildPlan()
+	require.NotNil(t, plan)
+	require.NoError(t, services.VerifyDockerBuildPlan(recipeRoot, plan))
+	require.Len(t, plan.GetRecipes(), 1)
+	require.Equal(t, "codefly.local/proof/word-count:"+r.Version, plan.GetRecipes()[0].GetImage())
+	require.Equal(t, builderv0.RecipeContextRoot_RECIPE_CONTEXT_ROOT_OUTPUT, plan.GetRecipes()[0].GetContextRoot())
+	require.FileExists(t, filepath.Join(recipeRoot, "runnable", "handler.py"))
+	require.NoDirExists(t, filepath.Join(recipeRoot, ".venv"), "the image context carries no host interpreter")
 
 	write(t, filepath.Join(root, "prepared", "runnable", "handler.py"), "def handle(context, input): return {\"count\": 888}\n")
 	_, err = client.Package(ctx, &builderv0.PackageRequest{OutputDirectory: filepath.Join(root, "tampered")})
